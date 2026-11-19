@@ -32,8 +32,9 @@ final class VisionCall: Identifiable {
     struct Trace: Encodable {
         let id: UUID
         let number: Int
-        let toolCallID: String
+        let toolCallID: String?
         let exchangeID: UUID?
+        let openingScan: Bool
         let avatar: [Int]
         let width: Int?
         let height: Int?
@@ -45,13 +46,15 @@ final class VisionCall: Identifiable {
     let number: Int
     let avatar: Position
     let frame: VisionFrame?
+    let openingScan: Bool
     private(set) var status: Status
 
-    init(number: Int, avatar: Position, frame: VisionFrame?, status: Status) {
+    init(number: Int, avatar: Position, frame: VisionFrame?, status: Status, openingScan: Bool) {
         self.number = number
         self.avatar = avatar
         self.frame = frame
         self.status = status
+        self.openingScan = openingScan
     }
 
     func update(_ status: Status) {
@@ -59,8 +62,8 @@ final class VisionCall: Identifiable {
         self.status = status
     }
 
-    func trace(for call: ToolCall) -> Trace {
-        Trace(id: id, number: number, toolCallID: call.id, exchangeID: call.debugExchangeID,
+    func trace(for call: ToolCall?) -> Trace {
+        Trace(id: id, number: number, toolCallID: call?.id, exchangeID: call?.debugExchangeID, openingScan: openingScan,
               avatar: [avatar.x, avatar.y], width: frame?.width, height: frame?.height, bytes: frame?.png.count)
     }
 }

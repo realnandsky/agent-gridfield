@@ -38,7 +38,7 @@ struct ToolReply: Sendable {
 }
 
 enum ModelTurn: Sendable {
-    case initial(WorldObservation)
+    case initial(WorldObservation, vision: VisionCall? = nil)
     case result(ToolReply)
 }
 
@@ -76,7 +76,7 @@ struct ChatCompletionsModel: CharacterModel {
         self.reasoningEffort = reasoningEffort
         self.streaming = streaming
         self.visionEnabled = visionEnabled
-        self.session = session ?? Self.networkSession
+        self.session = session ?? (streaming ? Self.streamingSession : Self.nonStreamingSession)
         self.debugger = debugger
     }
 
@@ -124,11 +124,12 @@ struct ChatCompletionsModel: CharacterModel {
         var vision: VisionCall?
         var replies: [ChatMessage] = []
         switch turn {
-        case .initial(let initialObservation):
+        case .initial(let initialObservation, let openingScan):
             observation = initialObservation
+            vision = openingScan
         case .result(let reply):
             observation = nil
-            if visionEnabled, !retryingTextResponse, reply.vision?.frame != nil { vision = reply.vision }
+            vision = reply.vision
             replies.append(ChatMessage(
                 role: "assistant",
                 toolCalls: [reply.call], reasoningContent: reply.call.reasoningContent
@@ -137,6 +138,7 @@ struct ChatCompletionsModel: CharacterModel {
                 role: "tool", content: try encoder.jsonString(reply.receipt), toolCallID: reply.call.id
             ))
         }
+        if !visionEnabled || retryingTextResponse || vision?.frame == nil { vision = nil }
         let userContent = try encoder.jsonString(PlayerTurn(
             goal: taskGoal, observation: observation, instructions: prompt.isEmpty ? nil : prompt
         ))
@@ -149,11 +151,16 @@ struct ChatCompletionsModel: CharacterModel {
             ChatMessage(role: "user", content: userContent),
         ] + replies
         if let frame = vision?.frame {
-            // Chat Completions tool messages carry text. Append the image after the matching receipt.
-            messages.append(ChatMessage(
-                role: "user", content: "Agent Gridfield vision result for the world in the preceding tool receipt.",
-                imageURL: "data:image/png;base64," + frame.png.base64EncodedString()
-            ))
+            let imageURL = "data:image/png;base64," + frame.png.base64EncodedString()
+            if observation != nil {
+                messages[messages.count - 1].imageURL = imageURL
+            } else {
+                // Tool messages carry text. Send the image after its matching receipt.
+                messages.append(ChatMessage(
+                    role: "user", content: "Agent Gridfield vision result for the world in the preceding tool receipt.",
+                    imageURL: imageURL
+                ))
+            }
         }
 
         let isZhipu = ModelSettings.isZhipuHost(endpoint.host)
@@ -188,7 +195,7 @@ struct ChatCompletionsModel: CharacterModel {
                 requestHeaders: debugHeaders(request.allHTTPHeaderFields ?? [:]),
                 requestBody: redacted(String(decoding: loggedPayload, as: UTF8.self)), visionID: vision?.id
             )
-            await debugger.record(exchange, apiKey: apiKey)
+            try await debugger.record(exchange, apiKey: apiKey)
             exchangeID = exchange.id
         } else {
             exchangeID = nil
@@ -288,12 +295,15 @@ struct ChatCompletionsModel: CharacterModel {
         redaction.redact(text)
     }
 
-    private static let networkSession: URLSession = {
+    private static let streamingSession = networkSession(resourceTimeout: 30 * 60)
+    private static let nonStreamingSession = networkSession(resourceTimeout: 180)
+
+    private static func networkSession(resourceTimeout: TimeInterval) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 90
-        configuration.timeoutIntervalForResource = 180
+        configuration.timeoutIntervalForResource = resourceTimeout
         return URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
-    }()
+    }
 
     private static let rules = """
         You control the avatar in Agent Gridfield. The player supplies goal and optional instructions.
@@ -396,8 +406,9 @@ struct ChatCompletionsModel: CharacterModel {
 
 
         [Vision]
+        The first request includes an opening map when available. It depicts the initial text observation.
         vision({}) supplies one coordinate-labeled image of receipt.observation in the next model request.
-        The image is available in that request only. Each call uses a model turn and one image input.
+        Each image is available only in the request that contains it. Each vision tool call uses a model turn and one image input.
         The x labels are columns and the y labels are rows. [0,0] is the upper-left cell.
         """
 

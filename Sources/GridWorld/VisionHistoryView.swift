@@ -44,7 +44,11 @@ struct VisionHistoryView: View {
                                     .frame(width: 18)
                                     .accessibilityHidden(true)
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("Call #\(call.number)").fontWeight(.medium)
+                                    if call.openingScan {
+                                        Text("Opening Scan").fontWeight(.medium)
+                                    } else {
+                                        Text("Call #\(call.number)").fontWeight(.medium)
+                                    }
                                     Text(call.requestedAt, format: .dateTime.hour().minute().second())
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
@@ -65,13 +69,13 @@ struct VisionHistoryView: View {
                 }
             } else {
                 ContentUnavailableView("No Vision Calls", systemImage: "eye",
-                                       description: Text("Maps and delivery status appear here when the agent calls vision."))
+                                       description: Text("Opening scans and maps requested by the agent appear here."))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(minWidth: 650, idealWidth: 860, minHeight: 410, idealHeight: 575)
         .onChange(of: calls.last?.id, initial: true) { _, latest in
-            if selection == nil { selection = latest }
+            if !calls.contains(where: { $0.id == selection }) { selection = latest }
         }
     }
 

@@ -128,8 +128,19 @@ private struct GameView: View {
 
     private var worldPane: some View {
         HStack(spacing: 19) {
-            WorldMap(world: session.world)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(alignment: .trailing, spacing: 8) {
+                Button {
+                    session.reset()
+                    debugger.clear()
+                } label: {
+                    Label("Reset World", systemImage: "arrow.counterclockwise")
+                }
+                .controlSize(.small)
+                .help("Stop the current run and reset the map, character, and history")
+
+                WorldMap(world: session.world)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             VStack(alignment: .leading, spacing: 12) {
                 Text("Inventory")
@@ -169,10 +180,10 @@ private struct GameView: View {
     }
 
     private func start() {
-        updateDebugInputs()
         do {
             let settings = try ModelSettings.activeConfiguration.resolve()
-            session.start(model: try settings.makeClient(debugger: debugger, taskGoal: currentGoal))
+            let model = try settings.makeClient(debugger: debugger, taskGoal: currentGoal)
+            session.start(model: model, inputs: debugInputs(for: settings.configuration))
         } catch {
             session.issue = error.localizedDescription
         }
@@ -180,11 +191,13 @@ private struct GameView: View {
 
     private func updateDebugInputs() {
         guard debugExportEnabled else { return }
-        let configuration = ModelSettings.activeConfiguration
-        session.updateDebugInputs(.init(goal: currentGoal, instructions: debugger.prompt,
-                                        address: configuration.address, model: configuration.model,
-                                        reasoningEffort: configuration.effort.rawValue,
-                                        streaming: configuration.streaming, visionEnabled: configuration.allowsVision))
+        session.updateDebugInputs(debugInputs(for: ModelSettings.activeConfiguration))
+    }
+
+    private func debugInputs(for configuration: ModelSettings.Configuration) -> GameSession.DebugInputs {
+        .init(goal: currentGoal, instructions: debugger.prompt, address: configuration.address,
+              model: configuration.model, reasoningEffort: configuration.effort.rawValue,
+              streaming: configuration.streaming, visionEnabled: configuration.allowsVision)
     }
 }
 

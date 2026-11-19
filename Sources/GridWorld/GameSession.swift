@@ -18,7 +18,7 @@ final class GameSession {
 
     struct DebugInputs: Encodable, Equatable {
         let goal: String
-        let instructions: String
+        var instructions: String
         let address: String
         let model: String
         let reasoningEffort: String
@@ -124,15 +124,23 @@ final class GameSession {
     }
 
     func updateDebugInputs(_ inputs: DebugInputs) {
-        guard let debugExport, inputs != debugInputs else { return }
-        debugInputs = inputs
-        debugExport.event("inputs_changed", inputs)
+        guard let debugExport else { return }
+        var current = isRunning ? debugInputs ?? inputs : inputs
+        current.instructions = inputs.instructions
+        guard current != debugInputs else { return }
+        debugInputs = current
+        debugExport.event("inputs_changed", current)
         exportState()
     }
 
-    func start(model: any CharacterModel) {
+    func start(model: any CharacterModel, inputs: DebugInputs? = nil) {
         guard !isRunning else { return }
-        stop()
+        if let inputs = inputs ?? debugInputs {
+            if debugExport?.beginRun(model: inputs.model, effort: inputs.reasoningEffort) == true {
+                debugInputs = nil
+            }
+            updateDebugInputs(inputs)
+        }
         let id = UUID()
         runID = id
         isRunning = true
@@ -149,6 +157,20 @@ final class GameSession {
         endRun(reason: "stopped")
     }
 
+    func reset() {
+        endRun(reason: "reset")
+        world = World()
+        messages.removeAll()
+        visionCalls.removeAll()
+        notebook = ""
+        memoryEntries.removeAll()
+        recentHistory = RecentHistory()
+        activeHistory.removeAll()
+        issue = nil
+        debugExport?.event("world_reset", [String: String]())
+        exportState()
+    }
+
     private func endRun(reason: String) {
         guard let runID else { return }
         debugExport?.event("run_ended", RunEnd(runID: runID, reason: reason, batch: batchProgress))
@@ -160,6 +182,7 @@ final class GameSession {
         batchProgress = nil
         phase = .idle
         exportState()
+        debugExport?.closeRun()
     }
 
     private func run(model: any CharacterModel, id: UUID) async {
@@ -172,20 +195,26 @@ final class GameSession {
 
         let clock = ContinuousClock()
         var nextActionAt = clock.now
+        var pendingVision: VisionCall?
         do {
-            var decision = try await Self.chooseTool(.initial(world.observation(notebook: notebook)), using: model)
+            try checkRun(id)
+            if model.visionEnabled {
+                let frame = WorldMap(world: world).visionFrame()
+                pendingVision = recordVision(frame: frame, status: frame == nil ? .renderFailed : .pending)
+                exportState()
+            }
+            let firstTurn = ModelTurn.initial(world.observation(notebook: notebook), vision: pendingVision)
+            var decision = try await Self.chooseTool(firstTurn, using: model)
+            pendingVision = nil
             while runID == id, !Task.isCancelled {
                 if decision.call.tool != .act {
                     phase = .awaitingModel
                     batchProgress = nil
                     let reply = handleTool(decision.call, visionEnabled: model.visionEnabled, run: id)
                     exportState()
-                    do {
-                        decision = try await Self.chooseTool(.result(reply), using: model)
-                    } catch {
-                        reply.vision?.update(Task.isCancelled ? .cancelled : .failed)
-                        throw error
-                    }
+                    pendingVision = reply.vision
+                    decision = try await Self.chooseTool(.result(reply), using: model)
+                    pendingVision = nil
                     continue
                 }
                 let (steps, receipt, historyEvents) = prepareBatch(decision.call)
@@ -213,6 +242,7 @@ final class GameSession {
                 decision = try await next
             }
         } catch {
+            pendingVision?.update(Task.isCancelled ? .cancelled : .failed)
             if runID == id, !Task.isCancelled {
                 completion = "failed"
                 issue = error.localizedDescription
@@ -301,10 +331,7 @@ final class GameSession {
                 status = frame == nil ? .renderFailed : .pending
                 results = frame == nil ? [.visionUnavailable] : [.inspected]
             }
-            let record = VisionCall(number: visionCalls.count + 1, avatar: world.avatar, frame: frame, status: status)
-            visionCalls.append(record)
-            debugExport?.event("vision_called", record.trace(for: call))
-            vision = record
+            vision = recordVision(frame: frame, status: status, call: call)
         case .act, nil:
             results = [.unknownTool]
         }
@@ -316,6 +343,14 @@ final class GameSession {
         debugExport?.event("tool_processed", ToolEvent(runID: id, call: call,
                             exchangeID: call.debugExchangeID, receipt: receipt))
         return ToolReply(call: call, receipt: receipt, vision: vision)
+    }
+
+    private func recordVision(frame: VisionFrame?, status: VisionCall.Status, call: ToolCall? = nil) -> VisionCall {
+        let record = VisionCall(number: visionCalls.count + 1, avatar: world.avatar, frame: frame,
+                                status: status, openingScan: call == nil)
+        visionCalls.append(record)
+        debugExport?.event("vision_called", record.trace(for: call))
+        return record
     }
 
     private func prepareBatch(_ call: ToolCall)

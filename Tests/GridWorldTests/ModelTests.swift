@@ -121,13 +121,30 @@ func glmFlashContinuesAfterToolReceipt(streaming: Bool) async throws {
     #expect(try DebugExport.launch(arguments: ["GridWorld", "--no-debug-export"], automaticRoot: automatic) == nil)
     let launched = try DebugExport.launch(arguments: ["GridWorld"], automaticRoot: automatic)
     let export = try #require(launched)
+    let start = Date(timeIntervalSince1970: 1_800_000_000)
+    export.beginRun(model: "provider/glm-5.3-flash", effort: "max", at: start)
     export.snapshot(["state": "ready"])
+    let debugger = APIDebugger(debugExport: export)
+    let exchange = APIExchange(method: "POST", address: "https://model.example", requestHeaders: "", requestBody: "{}")
+    try debugger.record(exchange)
+    export.closeRun()
+    export.beginRun(model: "provider/glm-5.3-flash", effort: "max", at: start)
+    export.snapshot(["state": "new"])
+    debugger.finish(exchange.id, with: .cancelled)
     let sessions = try manager.contentsOfDirectory(atPath: automatic.path)
     #expect(sessions.filter { $0.hasPrefix("session-\(inactivePID)-") }.count == 3)
     #expect(sessions.contains(active.lastPathComponent))
-    let state = try #require(sessions.map { automatic.appendingPathComponent($0).appendingPathComponent("state.json") }
-        .first { manager.fileExists(atPath: $0.path) })
-    #expect(try JSONDecoder().decode([String: String].self, from: Data(contentsOf: state)) == ["state": "ready"])
+    let namedRuns = sessions.filter { $0.hasPrefix("provider-glm-5.3-flash_max_") }
+    try #require(namedRuns.count == 2)
+    for name in namedRuns {
+        #expect(name.hasSuffix("_p\(currentPID)"))
+        let run = automatic.appendingPathComponent(name)
+        let state = try Data(contentsOf: run.appendingPathComponent("state.json"))
+        let record = try JSONDecoder().decode([String: String].self, from: state)
+        let journal = try String(contentsOf: run.appendingPathComponent("events.jsonl"), encoding: .utf8)
+        #expect(journal.contains(exchange.id.uuidString) == (record["state"] == "ready"))
+        #expect(journal.contains("api_update") == (record["state"] == "ready"))
+    }
 
     let override = root.appendingPathComponent("explicit")
     let custom = try DebugExport.launch(arguments: ["GridWorld", "--debug-dir", override.path],
@@ -179,6 +196,54 @@ func stoppedRunCannotApplyLateReplyOrStopNewRun() async throws {
     await newTask.value
     #expect(!game.isRunning)
     #expect(game.world == world)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
+func resetClearsTheWorldAndHistoryWhileCancelingTheRun() async throws {
+    let trace = DebugTraceFiles()
+    let export = try DebugExport(directory: trace.directory)
+    defer { try? FileManager.default.removeItem(at: trace.directory) }
+    let game = GameSession(actionDelay: .zero, debugExport: export)
+    let model = ScriptedTools([
+        toolCall("note", .memory, #"{"text":"Keep the east door","set":{"door":"east"}}"#),
+        batchCall("build", """
+        [{"action":"collect","direction":"north","target":"above"},
+         {"action":"collect","direction":"north","target":"item","item":"log"},
+         {"action":"craft","item":"plank"},{"action":"place","direction":"east","structure":"floor"},
+         {"action":"move","direction":"east"},{"action":"say","text":"Built a floor."},{"action":"finish"}]
+        """),
+    ])
+    game.start(model: model)
+    await (try #require(game.task)).value
+    #expect(game.world.avatar == Position(x: 9, y: 5))
+    #expect(game.world.inventory == [.plank: 3])
+    #expect(game.notebook == "Keep the east door")
+    #expect(game.messages.count == 1)
+
+    let pending = SuspendedModel()
+    game.start(model: pending)
+    let task = try #require(game.task)
+    await pending.waitUntilRequested()
+    game.reset()
+    await pending.respond(with: batchCall("late", #"[{"action":"move","direction":"east"}]"#))
+    await task.value
+
+    #expect(task.isCancelled)
+    #expect(!game.isRunning)
+    #expect(game.world.avatar == Position(x: 8, y: 5))
+    #expect(game.world.tile(at: Position(x: 9, y: 5))?.hasFloor == false)
+    #expect(game.world.tile(at: Position(x: 8, y: 4))?.terrain == .tree)
+    #expect(game.world.inventory.isEmpty)
+    #expect(game.notebook.isEmpty)
+    #expect(game.memoryEntries.isEmpty)
+    #expect(game.messages.isEmpty)
+    #expect(game.visionCalls.isEmpty)
+    #expect(game.issue == nil)
+    let events = try trace.events()
+    #expect(events.last { $0.kind == "run_ended" }?.data["reason"] as? String == "reset")
+    #expect(events.last?.kind == "world_reset")
+    #expect(try trace.state().observation.avatar == [8, 5])
 }
 
 @MainActor
@@ -357,10 +422,11 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
     #expect(game.issue == nil)
     let calls = game.visionCalls
     #expect(game.messages.isEmpty)
-    #expect(calls.map(\.number) == [1, 2, 3])
-    #expect(calls.map(\.status) == [.sent, .sent, .invalid])
-    try #require(calls.count == 3)
-    #expect(calls[2].frame == nil)
+    #expect(calls.map(\.number) == [1, 2, 3, 4])
+    #expect(calls.map(\.status) == [.sent, .sent, .sent, .invalid])
+    #expect(calls.map(\.openingScan) == [true, false, false, false])
+    try #require(calls.count == 4)
+    #expect(calls[3].frame == nil)
     let records = await StubChatEndpoint.visionService.records
     try #require(records.count == 6)
     let bodies: [[[String: Any]]] = try records.map { record in
@@ -372,9 +438,10 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
         return try #require(json["messages"] as? [[String: Any]])
     }
     #expect(bodies.map(\.count) == [2, 5, 4, 4, 5, 4])
-    for (call, requestIndex) in zip(calls, [1, 4]) {
+    for (call, requestIndex) in zip(calls, [0, 1, 4]) {
         let messages = bodies[requestIndex]
-        #expect(messages.compactMap { $0["role"] as? String } == ["system", "user", "assistant", "tool", "user"])
+        let roles = call.openingScan ? ["system", "user"] : ["system", "user", "assistant", "tool", "user"]
+        #expect(messages.compactMap { $0["role"] as? String } == roles)
         let parts = try #require(messages.last?["content"] as? [[String: Any]])
         #expect(parts.compactMap { $0["type"] as? String } == ["text", "image_url"])
         let url = try #require((parts.last?["image_url"] as? [String: Any])?["url"] as? String)
@@ -384,16 +451,24 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
         #expect(Data(base64Encoded: String(url.dropFirst(prefix.count))) == frame.png)
         #expect(frame.png.prefix(8) == Data([137, 80, 78, 71, 13, 10, 26, 10]))
         #expect(frame.width == 736 && frame.height == 536)
-        let receipt = try decode(WireReceipt.self, messages[3]["content"] as? String)
-        #expect(receipt.observation.avatar == [call.avatar.x, call.avatar.y])
+        if call.openingScan {
+            let turn = try decode(WirePlayerTurn.self, parts.first?["text"] as? String)
+            #expect(turn.observation?.avatar == [call.avatar.x, call.avatar.y])
+        } else {
+            let receipt = try decode(WireReceipt.self, messages[3]["content"] as? String)
+            #expect(receipt.observation.avatar == [call.avatar.x, call.avatar.y])
+        }
         #expect(debugger.exchanges[requestIndex].visionID == call.id)
     }
-    #expect(calls.map { [$0.avatar.x, $0.avatar.y] } == [[8, 5], [9, 5], [9, 5]])
-    #expect(calls[0].frame?.png != calls[1].frame?.png)
-    #expect(debugger.exchanges.compactMap(\.visionID) == Array(calls.prefix(2).map(\.id)))
+    #expect(calls.map { [$0.avatar.x, $0.avatar.y] } == [[8, 5], [8, 5], [9, 5], [9, 5]])
+    #expect(calls[1].frame?.png != calls[2].frame?.png)
+    #expect(debugger.exchanges.compactMap(\.visionID) == Array(calls.prefix(3).map(\.id)))
     #expect(debugger.exchanges.allSatisfy { !$0.requestBody.contains("iVBORw0KGgo") })
     let events = try trace.events().filter { $0.kind == "vision_called" }
+    #expect(events.first?.data["openingScan"] as? Bool == true)
     #expect(events.compactMap { $0.data["toolCallID"] as? String } == ["vision-1", "vision-2", "vision-3"])
+    game.reset()
+    #expect(game.visionCalls.isEmpty)
 }
 
 @MainActor
@@ -787,7 +862,7 @@ private actor SuspendedModel: CharacterModel {
             return batchCall("fallback", #"[{"action":"finish"}]"#)
         }
         previousRequest = true
-        if case .initial(let observation) = turn { initialObservation = observation }
+        if case .initial(let observation, _) = turn { initialObservation = observation }
         return await withCheckedContinuation { continuation in
             action = continuation
             requested?.resume()

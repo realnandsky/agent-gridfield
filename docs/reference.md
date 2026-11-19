@@ -8,6 +8,8 @@ Open **Settings** with the toolbar gear or ⌘,. Enter the complete Chat Complet
 
 **Reasoning Effort** offers Provider Default, Off, Low, High, and Maximum, subject to provider and model support. **Stream Responses** is on by default and can be turned off for compatibility. Both settings apply on the next run. During a streamed request, the main window shows the request phase and the debugger's **Response** view shows the incoming content. The app executes only complete tool calls.
 
+Requests time out after 90 seconds without new data. A single streamed request can run for up to 30 minutes. The total limit for a nonstreamed request is 3 minutes.
+
 **Vision** defaults to on for the GPT-5 mini and GLM-5.3-Flash presets. For a different model, enable it if the model supports image input and function tools. Changes take effect on the next run.
 
 The Zhipu AI preset uses a standard API key. The GLM-5.3-Flash preset offers Low, High, and Maximum for reasoning and requests streamed tool arguments when streaming is enabled.
@@ -18,7 +20,7 @@ Click **Developer Tools** (`{}`) in the toolbar. Select an API request to inspec
 
 Use **Additional Instructions** to send extra guidance with the next request. Click **Apply** to set it or apply an empty field to clear it.
 
-Open **Notebook** to read the agent's current notes and named entries. Requests and tool receipts show the values present at the time. The `memory` tool replaces the notebook when given `text`. Empty text clears it. The notebook can hold up to 2,400 UTF-8 bytes and travels with each observation. It persists when a run is stopped and started in the same world and resets when the app reopens.
+Open **Notebook** to read the agent's current notes and named entries. Requests and tool receipts show the values present at the time. The `memory` tool replaces the notebook when given `text`. Empty text clears it. The notebook can hold up to 2,400 UTF-8 bytes and travels with each observation. It persists when a run is stopped and started in the same world and clears when the world is reset or the app reopens.
 
 The same tool can update named entries, for example `{"set":{"idea":"Build a path by the lake"},"remove":["old-plan"]}`. IDs and text share a separate 2,400-byte limit. All changes in one call apply together. Invalid or oversized updates leave the prior values in place. `memory.entries` is included with tool receipts and appears in **Notebook**. A new run in the same world sees saved entries in its first tool receipt.
 
@@ -26,13 +28,13 @@ The same tool can update named entries, for example `{"set":{"idea":"Build a pat
 
 ### Vision History
 
-An agent with vision enabled can call `vision({})` to request a 17 × 12 map labeled with coordinates. The image and its accompanying text observation describe the same world state. The app sends each rendered image with the immediately following API request.
+When vision is enabled, the first model request includes a 17 × 12 opening map labeled with coordinates. The agent can call `vision({})` during play to request a fresh map with its tool receipt. Each image and its accompanying text observation describe the same world state. Each image is sent once.
 
-Open **Vision History** in Developer Tools to see every call in the session, its map, and its delivery status. API requests with a map have an eye indicator. In the **Request** view, **View Sent Map** opens the matching image. The logged body lists the image dimensions and size in bytes.
+Open **Vision History** in Developer Tools to see opening scans, maps requested by the agent, and their delivery status. API requests with a map have an eye indicator. In the **Request** view, **View Sent Map** opens the matching image. The logged body lists the image dimensions and size in bytes.
 
 ### Live debug exports
 
-Since version 1.8.1, the app writes a live trace by default to a private session directory under `~/Library/Caches/io.gridworld.macos/DebugTrace/`. The directory name and `state.json` include the process ID. Match the process ID, timestamp, and goal to the session you want to inspect. The event journal rotates at about 16 MiB, preserving the latest segment and `events.previous.jsonl`. At startup, the cache keeps open sessions and the three most recent closed ones.
+The app writes a live trace by default to a private directory for each run under `~/Library/Caches/io.gridworld.macos/DebugTrace/`. Directory names include the model, reasoning effort, local start time, and process ID, for example `glm-5.3-flash_max_2026-11-19_21-49-09-000_p23855`. The event journal rotates at about 16 MiB, preserving the latest segment and `events.previous.jsonl`. At launch, the cache keeps traces from running app processes and the three most recent traces from closed ones.
 
 Pass `--no-debug-export` to disable disk exports. To capture an isolated run, launch a separate instance with `--debug-dir` and a new absolute path.
 
@@ -46,13 +48,13 @@ After the app opens, read `"$trace_root/session/state.json"` or follow `"$trace_
 - `state.json` records the latest applied state, including the task goal, additional instructions, model settings, both map layers, avatar, inventory, notebook, character messages, vision call count, errors, and batch progress. Loose and attached items have separate counts. Each update replaces the file as a whole.
 - `events.jsonl` records each event with a time and sequence number. Use `exchangeID` to connect requests, streaming updates, responses or failures, and projected batch receipts. Use the tool call ID and zero-based action index to find outcomes actually applied to the world. An interrupted batch retains both its projected receipt and its actual progress. The final streaming update contains the assembled response.
 - `walk_step` records each cell traversed by `walk_to`, with the action index, one-based step number, and avatar coordinates. `action_processed` records the arrival.
-- `tool_processed` records receipts for individual tools. `vision_called` records the vision ID, tool call ID, source exchange, and frame dimensions. The subsequent `api_request` uses `visionID` to identify the frame it carries.
+- `tool_processed` records receipts for individual tools. `vision_called` records the vision ID and frame dimensions, along with the tool call ID and source exchange for agent-requested maps. The initial scan has `openingScan: true`. The subsequent `api_request` uses `visionID` to identify the frame it carries.
 
-API records use the same key and header redaction as the debugger. Clearing API history adds a journal event. Trace files may still contain goals, prompts, and model output. They are intended for local debugging.
+API records use the same key and header redaction as the debugger. Clearing API history during a trace adds a journal event. Trace files may still contain goals, prompts, and model output. They are intended for local debugging.
 
 ## The world and its tools
 
-The map is 17 columns by 12 rows. The character moves one cell at a time in four directions. Grass, bushes, wood floors, and grass beds are walkable. Water, trees, walls, and corners block movement. Reopening the app resets the map and redistributes the bushes.
+The map is 17 columns by 12 rows. The character moves one cell at a time in four directions. Grass, bushes, wood floors, and grass beds are walkable. Water, trees, walls, and corners block movement. **Reset World**, above the map, stops the current run and starts a fresh map with newly distributed bushes. It resets the character, inventory, notebook, and in-app activity, vision, and API history. Exported trace files remain available.
 
 - `collect` takes an item or block from a neighboring cell. With `target: item`, it collects a single named item, starting with loose items before attached ones. With `target: above`, it harvests grass, removes a bed or wall, or fells a tree that drops two logs in its cell. With `target: ground`, it removes a floor, returns one plank, and restores grass. Dots on tree canopies show the remaining branches.
 - `craft` uses inventory items. One log makes four planks. Two grass and two planks make one grass bed.

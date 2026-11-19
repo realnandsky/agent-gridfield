@@ -46,6 +46,7 @@ final class APIDebugger {
     }
 
     private let export: DebugExport?
+    @ObservationIgnored private var requestJournals: [UUID: DebugJournal] = [:]
     var prompt = ""
     private(set) var exchanges: [APIExchange] = []
 
@@ -53,14 +54,19 @@ final class APIDebugger {
         export = debugExport
     }
 
-    func record(_ exchange: APIExchange, apiKey: String? = nil) {
+    func record(_ exchange: APIExchange, apiKey: String? = nil) throws {
+        try Task.checkCancellation()
         exchanges.append(exchange)
-        export?.registerAPIKey(apiKey)
-        export?.event("api_request", exchange)
+        if let journal = export?.currentJournal {
+            requestJournals[exchange.id] = journal
+            journal.registerAPIKey(apiKey)
+            journal.event("api_request", exchange)
+        }
     }
 
     func finish(_ id: UUID, with outcome: APIExchange.Outcome) {
-        export?.event("api_update", APIUpdate(exchangeID: id, outcome: outcome))
+        requestJournals[id]?.event("api_update", APIUpdate(exchangeID: id, outcome: outcome))
+        if outcome.liveLabel == nil { requestJournals[id] = nil }
         guard let index = exchanges.lastIndex(where: { $0.id == id }) else { return }
         exchanges[index].outcome = outcome
     }
