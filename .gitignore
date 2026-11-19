@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+dist/
+/outputs/
+/debug/
+/DebugTrace/
+*.app/
+*.zip
+.env
+.env.*
+.DS_Store
