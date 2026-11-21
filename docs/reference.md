@@ -96,7 +96,7 @@ Floors occupy the ground layer. Trees, bushes, walls, and beds occupy the upper 
 
 ## Tests
 
-Run `swift test` with a full Xcode toolchain. With standalone Command Line Tools 27, point Swift at the Swift Testing plugin.
+Run `./Scripts/test.sh`. It detects standalone Command Line Tools and adds the Swift Testing plugin path automatically, or runs `swift test` directly with a full Xcode toolchain:
 
 ```sh
 swift test --disable-xctest -Xswiftc -plugin-path \
