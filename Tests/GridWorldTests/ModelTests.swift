@@ -473,6 +473,54 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
+func multipleToolCallsRunInOrderAndReturnOneReceiptPerCall() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StubChatEndpoint.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let endpoint = try #require(URL(string: "https://model.example/multi-tool-test"))
+    let debugger = APIDebugger()
+    let game = GameSession(actionDelay: .zero)
+    game.start(model: ChatCompletionsModel(
+        endpoint: endpoint, model: "test-model", apiKey: nil, taskGoal: "Take a step and inspect the map",
+        streaming: false, visionEnabled: true, session: session, debugger: debugger
+    ))
+    await (try #require(game.task)).value
+
+    #expect(game.issue == nil)
+    #expect(game.notebook == "Remember the route")
+    #expect(game.messages.map(\.text) == ["Moved east"])
+    #expect(game.visionCalls.map(\.status) == [.sent, .sent, .sent])
+    #expect(game.world.avatar == Position(x: 9, y: 5))
+
+    try #require(debugger.exchanges.count == 2)
+    let followUp = debugger.exchanges[1]
+    #expect(followUp.visionID == game.visionCalls[1].id)
+    #expect(followUp.additionalVisionIDs == [game.visionCalls[2].id])
+    #expect(!followUp.requestBody.contains("data:image/png;base64,"))
+    let body = try #require(JSONSerialization.jsonObject(with: Data(followUp.requestBody.utf8)) as? [String: Any])
+    let messages = try #require(body["messages"] as? [[String: Any]])
+    #expect(messages.compactMap { $0["role"] as? String } ==
+            ["system", "user", "assistant"] + Array(repeating: "tool", count: 6) + ["user", "user"])
+    let assistant = try #require(messages.first { $0["role"] as? String == "assistant" })
+    let calls = try #require(assistant["tool_calls"] as? [[String: Any]])
+    let expectedIDs = ["plan", "before", "step", "after", "inspect", "speak"]
+    #expect(calls.compactMap { $0["id"] as? String } == expectedIDs)
+    #expect(assistant["reasoning_content"] as? String == "Save and execute")
+    let receipts = messages.filter { $0["role"] as? String == "tool" }
+    #expect(receipts.compactMap { $0["tool_call_id"] as? String } == expectedIDs)
+    let decoded = try receipts.map { try decode(WireReceipt.self, $0["content"] as? String) }
+    #expect(decoded.map { $0.observation.avatar } == [[8, 5], [8, 5], [9, 5], [9, 5], [9, 5], [9, 5]])
+    #expect(decoded.allSatisfy { $0.observation.notebook == "Remember the route" })
+    #expect(decoded.map(\.results) == [[.memoryUpdated], [.inspected], [.moved], [.inspected], [.inspected], [.messageSent]])
+    let attachments = messages.suffix(2).compactMap { $0["content"] as? [[String: Any]] }
+    try #require(attachments.count == 2)
+    #expect((attachments[0].first?["text"] as? String)?.contains("before") == true)
+    #expect((attachments[1].first?["text"] as? String)?.contains("after") == true)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
 func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [StubChatEndpoint.self]
@@ -521,7 +569,7 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
         #expect(!String(decoding: data, as: UTF8.self).contains("test-only"))
         requests.append(try JSONDecoder().decode(RecordedBody.self, from: data))
     }
-    #expect(requests.allSatisfy { !$0.parallelToolCalls && !$0.store && $0.model == "test-model" })
+    #expect(requests.allSatisfy { $0.parallelToolCalls && !$0.store && $0.model == "test-model" })
     #expect(requests.allSatisfy { $0.tools.map(\.function.name) == ["act", "memory", "query"] })
     #expect(requests[0].messages.map(\.role) == ["system", "user"])
     let firstTurn = try decode(WirePlayerTurn.self, requests[0].messages[1].content)
@@ -665,7 +713,7 @@ func debugPromptAndFailedResponsesAreCapturedWithoutCredentials() async throws {
             session: session, debugger: debugger
         )
         do {
-            _ = try await client.chooseTool(.initial(World().observation()))
+            _ = try await client.chooseTools(.initial(World().observation()))
             Issue.record("Expected HTTP 400")
         } catch {
             #expect(error.localizedDescription.contains("HTTP 400"))
@@ -721,7 +769,7 @@ func streamedReasoningAndActionsAreAssembledAndIncompleteStreamIsRejected() asyn
     let model = ChatCompletionsModel(endpoint: endpoint, model: "deepseek-flash", apiKey: nil, taskGoal: "Take one step",
                                      reasoningEffort: "low", session: session, debugger: debugger)
     let turn = ModelTurn.initial(World().observation())
-    let requestTask = Task { try await model.chooseTool(turn) }
+    let requestTask = Task { try await model.chooseTools(turn) }
     let deadline = ContinuousClock.now.advanced(by: .seconds(2))
     var sawPlanningBeforeCompletion = false
     while ContinuousClock.now < deadline {
@@ -732,8 +780,10 @@ func streamedReasoningAndActionsAreAssembledAndIncompleteStreamIsRejected() asyn
         try await Task.sleep(for: .milliseconds(10))
     }
     #expect(sawPlanningBeforeCompletion)
-    let call = try await requestTask.value
-    #expect(call.id == "stream-call")
+    let calls = try await requestTask.value
+    #expect(calls.map(\.id) == ["stream-call", "stream-note"])
+    let call = try #require(calls.first)
+    #expect(calls.last?.function.arguments == #"{"text":"Remember"}"#)
     #expect(call.reasoningContent == "One step east — clear.")
     #expect(call.function.arguments == #"{"actions":[{"action":"move","direction":"east"}]}"#)
     #expect(try call.decodeBatch().actions.count == 1)
@@ -751,7 +801,7 @@ func streamedReasoningAndActionsAreAssembledAndIncompleteStreamIsRejected() asyn
     let incomplete = ChatCompletionsModel(endpoint: endpoint.appendingPathComponent("short"), model: "deepseek-flash",
                                           apiKey: nil, taskGoal: "Take one step", session: session, debugger: debugger)
     do {
-        _ = try await incomplete.chooseTool(turn)
+        _ = try await incomplete.chooseTools(turn)
         Issue.record("Expected to reject a truncated stream")
     } catch ModelAPIError.incompleteStream {
         // A complete-looking action is still unusable before the stream finishes.
@@ -840,11 +890,11 @@ private actor ScriptedTools: CharacterModel {
         self.calls = calls
     }
 
-    func chooseTool(_ turn: ModelTurn) async throws -> ToolCall {
-        if case .result(let reply) = turn { replies.append(reply) }
+    func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
+        if case .result(let results) = turn { replies.append(contentsOf: results) }
         guard calls.indices.contains(index) else { throw ModelAPIError.noToolCall(nil) }
         defer { index += 1 }
-        return calls[index]
+        return [calls[index]]
     }
 }
 
@@ -855,19 +905,20 @@ private actor SuspendedModel: CharacterModel {
     private var previousRequest = false
     private(set) var initialObservation: WorldObservation?
 
-    func chooseTool(_ turn: ModelTurn) async throws -> ToolCall {
+    func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
         if previousRequest {
-            if case .result(let reply) = turn { followUp.continuation.yield(reply) }
+            if case .result(let replies) = turn, let reply = replies.first { followUp.continuation.yield(reply) }
             followUp.continuation.finish()
-            return batchCall("fallback", #"[{"action":"finish"}]"#)
+            return [batchCall("fallback", #"[{"action":"finish"}]"#)]
         }
         previousRequest = true
         if case .initial(let observation, _) = turn { initialObservation = observation }
-        return await withCheckedContinuation { continuation in
+        let call = await withCheckedContinuation { continuation in
             action = continuation
             requested?.resume()
             requested = nil
         }
+        return [call]
     }
 
     func waitUntilRequested() async {
@@ -1097,9 +1148,13 @@ private final class StubChatEndpoint: URLProtocol, @unchecked Sendable {
 
                     data: {"choices":[{"index":0,"delta":{"reasoning_content":" — clear."}}]}
 
+                    data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"stream-note","type":"function","function":{"name":"memory","arguments":"{\"text\":"}}]}}]}
+
                     data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"stream-call","type":"function","function":{"name":"act","arguments":"{\"actions\":["}}]}}]}
 
                     data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"action\":\"move\",\"direction\":\"east\"}]}"}}]}}]}
+
+                    data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"Remember\"}"}}]}}]}
 
                     """#
                 let end = #"""
@@ -1114,6 +1169,23 @@ private final class StubChatEndpoint: URLProtocol, @unchecked Sendable {
                 status = 400
                 data = Data(#"{"error":{"message":"bad request test-only"}}"#.utf8)
                 headers = ["X-Request-Id": "test-request", "Set-Cookie": "private"]
+            } else if url.path == "/multi-tool-test" {
+                status = 200
+                headers = ["Content-Type": "application/json"]
+                let body = record.body.map { String(decoding: $0, as: UTF8.self) } ?? ""
+                let calls = body.contains(#""tool_call_id":"speak""#) ? [
+                    batchCall("done", #"[{"action":"finish"}]"#),
+                    toolCall("too-late", .memory, #"{"text":"This should be skipped"}"#),
+                ] : [
+                    toolCall("plan", .memory, #"{"text":"Remember the route"}"#),
+                    toolCall("before", .vision, "{}"),
+                    batchCall("step", #"[{"action":"move","direction":"east"}]"#),
+                    toolCall("after", .vision, "{}"),
+                    toolCall("inspect", .query, #"{"queries":[{"query":"find_resources","resource":"tree"}]}"#),
+                    batchCall("speak", #"[{"action":"say","text":"Moved east"}]"#),
+                ]
+                let encoded = String(decoding: try! JSONEncoder().encode(calls), as: UTF8.self)
+                data = Data(#"{"choices":[{"message":{"reasoning_content":"Save and execute","tool_calls":\#(encoded)},"finish_reason":"tool_calls"}]}"#.utf8)
             } else if url.path == "/vision-test" {
                 status = 200
                 data = await Self.visionService.reply(to: record)

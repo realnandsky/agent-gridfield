@@ -39,12 +39,12 @@ struct ToolReply: Sendable {
 
 enum ModelTurn: Sendable {
     case initial(WorldObservation, vision: VisionCall? = nil)
-    case result(ToolReply)
+    case result([ToolReply])
 }
 
 protocol CharacterModel: Sendable {
     var visionEnabled: Bool { get }
-    func chooseTool(_ turn: ModelTurn) async throws -> ToolCall
+    func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall]
 }
 
 extension CharacterModel {
@@ -80,39 +80,42 @@ struct ChatCompletionsModel: CharacterModel {
         self.debugger = debugger
     }
 
-    func chooseTool(_ turn: ModelTurn) async throws -> ToolCall {
+    func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
         let first = try await request(turn)
         do {
-            return try decodeCall(first.0, exchangeID: first.1)
+            return try decodeCalls(first.0, exchangeID: first.1)
         } catch ModelAPIError.textInsteadOfTool {
             let retry = try await request(turn, retryingTextResponse: true)
             do {
-                return try decodeCall(retry.0, exchangeID: retry.1)
+                return try decodeCalls(retry.0, exchangeID: retry.1)
             } catch ModelAPIError.textInsteadOfTool {
                 throw ModelAPIError.noToolCall("stop")
             }
         }
     }
 
-    private func decodeCall(_ data: Data, exchangeID: UUID?) throws -> ToolCall {
+    private func decodeCalls(_ data: Data, exchangeID: UUID?) throws -> [ToolCall] {
         guard let response = try? JSONDecoder().decode(ChatResponse.self, from: data),
               let choice = response.choices.first else {
             throw ModelAPIError.invalidResponse
         }
         let message = choice.message
         let calls = message.toolCalls ?? []
-        guard var call = calls.first else {
+        guard !calls.isEmpty else {
             if choice.finishReason == "stop", let content = message.content,
                !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 throw ModelAPIError.textInsteadOfTool
             }
             throw ModelAPIError.noToolCall(choice.finishReason.map(redacted))
         }
-        guard calls.count == 1 else { throw ModelAPIError.multipleToolCalls(calls.count) }
-        guard !call.id.isEmpty else { throw ModelAPIError.missingToolCallID }
-        call.reasoningContent = message.reasoningContent
-        call.debugExchangeID = exchangeID
-        return call
+        guard calls.allSatisfy({ !$0.id.isEmpty }) else { throw ModelAPIError.missingToolCallID }
+        guard Set(calls.map(\.id)).count == calls.count else { throw ModelAPIError.duplicateToolCallID }
+        return calls.map { call in
+            var call = call
+            call.reasoningContent = message.reasoningContent
+            call.debugExchangeID = exchangeID
+            return call
+        }
     }
 
     private func request(_ turn: ModelTurn, retryingTextResponse: Bool = false) async throws -> (Data, UUID?) {
@@ -121,45 +124,53 @@ struct ChatCompletionsModel: CharacterModel {
         let prompt = await debugger?.prompt ?? ""
         let instructionRole = endpoint.host == "api.openai.com" ? "developer" : "system"
         let observation: WorldObservation?
-        var vision: VisionCall?
-        var replies: [ChatMessage] = []
+        var images: [(vision: VisionCall, callID: String?)] = []
+        var history: [ChatMessage] = []
         switch turn {
         case .initial(let initialObservation, let openingScan):
             observation = initialObservation
-            vision = openingScan
-        case .result(let reply):
+            if let openingScan { images.append((openingScan, nil)) }
+        case .result(let replies):
             observation = nil
-            vision = reply.vision
-            replies.append(ChatMessage(
+            history.append(ChatMessage(
                 role: "assistant",
-                toolCalls: [reply.call], reasoningContent: reply.call.reasoningContent
+                toolCalls: replies.map(\.call), reasoningContent: replies.first?.call.reasoningContent
             ))
-            replies.append(ChatMessage(
-                role: "tool", content: try encoder.jsonString(reply.receipt), toolCallID: reply.call.id
-            ))
+            for reply in replies {
+                history.append(ChatMessage(
+                    role: "tool", content: try encoder.jsonString(reply.receipt), toolCallID: reply.call.id
+                ))
+                if let vision = reply.vision { images.append((vision, reply.call.id)) }
+            }
         }
-        if !visionEnabled || retryingTextResponse || vision?.frame == nil { vision = nil }
+        let frames = images.compactMap { image -> (vision: VisionCall, callID: String?, frame: VisionFrame)? in
+            guard visionEnabled, !retryingTextResponse, let frame = image.vision.frame else { return nil }
+            return (image.vision, image.callID, frame)
+        }
         let userContent = try encoder.jsonString(PlayerTurn(
             goal: taskGoal, observation: observation, instructions: prompt.isEmpty ? nil : prompt
         ))
         let retryReminder = retryingTextResponse
-            ? "\nYour previous response used plain text without a tool call. Submit exactly one tool call now. Use act's say to speak and act's finish to end the run."
+            ? "\nYour previous response used plain text without a tool call. Submit at least one tool call now. Use act's say to speak and act's finish to end the run."
             : ""
         let visionRules = visionEnabled ? Self.visionRules : ""
         var messages = [
             ChatMessage(role: instructionRole, content: Self.rules + visionRules + retryReminder),
             ChatMessage(role: "user", content: userContent),
-        ] + replies
-        if let frame = vision?.frame {
-            let imageURL = "data:image/png;base64," + frame.png.base64EncodedString()
-            if observation != nil {
-                messages[messages.count - 1].imageURL = imageURL
-            } else {
-                // Tool messages carry text. Send the image after its matching receipt.
+        ] + history
+        var imageMessageIndices: [Int] = []
+        for image in frames {
+            let imageURL = "data:image/png;base64," + image.frame.png.base64EncodedString()
+            if let callID = image.callID {
+                // Keep all tool receipts together, then identify each attached map by its call ID.
+                imageMessageIndices.append(messages.count)
                 messages.append(ChatMessage(
-                    role: "user", content: "Agent Gridfield vision result for the world in the preceding tool receipt.",
+                    role: "user", content: "Agent Gridfield map for vision tool call \(callID).",
                     imageURL: imageURL
                 ))
+            } else {
+                imageMessageIndices.append(1)
+                messages[1].imageURL = imageURL
             }
         }
 
@@ -169,7 +180,7 @@ struct ChatCompletionsModel: CharacterModel {
         var body = ChatRequest(model: model, messages: messages, tools: tools, toolChoice: "auto",
                                reasoningEffort: reasoningEffort, stream: streaming ? true : nil,
                                toolStream: toolStream ? true : nil,
-                               parallelToolCalls: isZhipu ? nil : false, store: isZhipu ? nil : false)
+                               parallelToolCalls: isZhipu ? nil : true, store: isZhipu ? nil : false)
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -182,18 +193,17 @@ struct ChatCompletionsModel: CharacterModel {
 
         let exchangeID: UUID?
         if let debugger {
-            let loggedPayload: Data
-            if let frame = vision?.frame {
-                body.messages[body.messages.count - 1].imageURL = "[PNG \(frame.width)×\(frame.height), \(frame.png.count) bytes]"
-                loggedPayload = try encoder.encode(body)
-            } else {
-                loggedPayload = payload
+            for (index, image) in zip(imageMessageIndices, frames) {
+                let frame = image.frame
+                body.messages[index].imageURL = "[PNG \(frame.width)×\(frame.height), \(frame.png.count) bytes]"
             }
+            let loggedPayload = frames.isEmpty ? payload : try encoder.encode(body)
             let exchange = APIExchange(
                 method: "POST",
                 address: redacted(endpoint.absoluteString),
                 requestHeaders: debugHeaders(request.allHTTPHeaderFields ?? [:]),
-                requestBody: redacted(String(decoding: loggedPayload, as: UTF8.self)), visionID: vision?.id
+                requestBody: redacted(String(decoding: loggedPayload, as: UTF8.self)), visionID: frames.first?.vision.id,
+                additionalVisionIDs: frames.count > 1 ? frames.dropFirst().map(\.vision.id) : nil
             )
             try await debugger.record(exchange, apiKey: apiKey)
             exchangeID = exchange.id
@@ -205,19 +215,19 @@ struct ChatCompletionsModel: CharacterModel {
         let response: HTTPURLResponse
         do {
             try Task.checkCancellation()
-            await vision?.update(.sending)
+            for image in frames { await image.vision.update(.sending) }
             try Task.checkCancellation()
             (data, response) = try await receive(request, exchangeID: exchangeID)
         } catch {
             let cancelled = Task.isCancelled || (error as? URLError)?.code == .cancelled
-            await vision?.update(cancelled ? .cancelled : .failed)
+            for image in frames { await image.vision.update(cancelled ? .cancelled : .failed) }
             if let debugger, let exchangeID {
                 await debugger.finish(exchangeID, with: cancelled ? .cancelled : .failed(message: redacted(error.localizedDescription)))
             }
             throw error
         }
         let succeeded = (200..<300).contains(response.statusCode)
-        await vision?.update(succeeded ? .sent : .rejected(response.statusCode))
+        for image in frames { await image.vision.update(succeeded ? .sent : .rejected(response.statusCode)) }
         if let debugger, let exchangeID {
             await debugger.finish(exchangeID, with: .response(
                 status: response.statusCode,
@@ -321,7 +331,7 @@ struct ChatCompletionsModel: CharacterModel {
         block_state = additional block conditions when present
 
         [Memory]
-        Each request includes the goal and current world observation. Subsequent requests include only the immediately preceding tool call, its reasoning when available, and its receipt as history.
+        Each request includes the goal and current world observation. Subsequent requests include the immediately preceding calls, their receipts in call order, and the preceding reasoning when available.
         The notebook and memory entries persist across stop and restart in the same world. The notebook text is in every observation; saved entries are in tool receipts at memory.entries.
         memory accepts optional text (replace the notebook, empty string clears it), set (entry ID to text), and remove (entry IDs).
         Entry IDs are nonblank strings. An ID can appear in either set or remove per call. All changes apply together.
@@ -393,7 +403,9 @@ struct ChatCompletionsModel: CharacterModel {
         each site has origin (top-left), entrance, stepsToEntrance (assuming entrance cleared), and clear (tree or bush coordinates)
 
         [Turn]
-        return exactly one available tool call and leave assistant content empty
+        return one or more available tool calls and leave assistant content empty
+        calls execute in the order returned, against the state left by earlier calls
+        the next request includes one receipt per call unless finish ends the run first
         action and query batches stop at the first failure or finish; earlier effects persist
         receipt = results (attempted outcomes in order), skipped (count), observation (final state)
         receipt.walks, when present, lists successful walks as {index, destination: [x,y], steps}; index is zero-based
@@ -408,7 +420,7 @@ struct ChatCompletionsModel: CharacterModel {
         [Vision]
         The first request includes an opening map when available. It depicts the initial text observation.
         vision({}) supplies one coordinate-labeled image of receipt.observation in the next model request.
-        Each image is available only in the request that contains it. Each vision tool call uses a model turn and one image input.
+        Each image is available only in the request that contains it. Each successful vision tool call supplies one image input identified by its tool call ID.
         The x labels are columns and the y labels are rows. [0,0] is the upper-left cell.
         """
 
@@ -659,7 +671,7 @@ enum ModelAPIError: LocalizedError {
     case incompleteStream
     case noToolCall(String?)
     case textInsteadOfTool
-    case multipleToolCalls(Int)
+    case duplicateToolCallID
     case missingToolCallID
 
     var errorDescription: String? {
@@ -682,8 +694,8 @@ enum ModelAPIError: LocalizedError {
             "The model did not call a tool. It finished with \(String(reason.prefix(60))). See Developer Tools for details."
         case .noToolCall, .textInsteadOfTool:
             "The model did not call a tool. See Developer Tools for the response."
-        case .multipleToolCalls(let count):
-            "The model returned \(count) tool calls. Each turn requires one tool call."
+        case .duplicateToolCallID:
+            "The model reused a tool call ID in one response. See Developer Tools for details."
         case .missingToolCallID:
             "The tool call is missing an ID. See Developer Tools for the response."
         }

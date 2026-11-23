@@ -34,6 +34,7 @@ struct APIExchange: Identifiable, Encodable, Sendable {
     let requestHeaders: String
     let requestBody: String
     var visionID: UUID? = nil
+    var additionalVisionIDs: [UUID]? = nil
     var outcome: Outcome = .waiting
 }
 

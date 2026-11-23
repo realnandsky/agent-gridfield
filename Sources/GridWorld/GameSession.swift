@@ -187,7 +187,9 @@ final class GameSession {
 
     private func run(model: any CharacterModel, id: UUID) async {
         var completion = "finished"
+        var pendingVision: [VisionCall] = []
         defer {
+            for vision in pendingVision { vision.update(.cancelled) }
             if runID == id {
                 endRun(reason: completion)
             }
@@ -195,54 +197,67 @@ final class GameSession {
 
         let clock = ContinuousClock()
         var nextActionAt = clock.now
-        var pendingVision: VisionCall?
         do {
             try checkRun(id)
             if model.visionEnabled {
                 let frame = WorldMap(world: world).visionFrame()
-                pendingVision = recordVision(frame: frame, status: frame == nil ? .renderFailed : .pending)
+                pendingVision.append(recordVision(frame: frame, status: frame == nil ? .renderFailed : .pending))
                 exportState()
             }
-            let firstTurn = ModelTurn.initial(world.observation(notebook: notebook), vision: pendingVision)
-            var decision = try await Self.chooseTool(firstTurn, using: model)
-            pendingVision = nil
-            while runID == id, !Task.isCancelled {
-                if decision.call.tool != .act {
-                    phase = .awaitingModel
-                    batchProgress = nil
-                    let reply = handleTool(decision.call, visionEnabled: model.visionEnabled, run: id)
+            let firstTurn = ModelTurn.initial(world.observation(notebook: notebook), vision: pendingVision.first)
+            var decision = try await Self.chooseTools(firstTurn, using: model)
+            pendingVision.removeAll()
+            turns: while runID == id, !Task.isCancelled {
+                var replies: [ToolReply] = []
+                let actionCount = decision.calls.count { $0.tool == .act }
+                for (index, call) in decision.calls.enumerated() {
+                    try checkRun(id)
+                    if call.tool != .act {
+                        phase = .awaitingModel
+                        batchProgress = nil
+                        let reply = handleTool(call, visionEnabled: model.visionEnabled, run: id)
+                        replies.append(reply)
+                        if let vision = reply.vision { pendingVision.append(vision) }
+                        exportState()
+                        continue
+                    }
+
+                    let (steps, receipt, historyEvents) = prepareBatch(call)
+                    let reply = ToolReply(call: call, receipt: receipt)
+                    replies.append(reply)
+                    phase = .playingBatch
+                    batchProgress = BatchProgress(toolCallID: call.id, exchangeID: call.debugExchangeID,
+                                                  attempted: receipt.results.count, skipped: receipt.skipped)
+                    debugExport?.event("batch_projected", ToolEvent(runID: id, call: call,
+                                       exchangeID: call.debugExchangeID, receipt: receipt))
                     exportState()
-                    pendingVision = reply.vision
-                    decision = try await Self.chooseTool(.result(reply), using: model)
-                    pendingVision = nil
-                    continue
-                }
-                let (steps, receipt, historyEvents) = prepareBatch(decision.call)
-                let reply = ToolReply(call: decision.call, receipt: receipt)
-                phase = .playingBatch
-                batchProgress = BatchProgress(toolCallID: reply.call.id, exchangeID: reply.call.debugExchangeID,
-                                              attempted: receipt.results.count, skipped: receipt.skipped)
-                debugExport?.event("batch_projected", ToolEvent(runID: id, call: reply.call,
-                                    exchangeID: reply.call.debugExchangeID, receipt: receipt))
-                exportState()
-                let stepCount = steps.reduce(0) { $0 + $1.count }
-                let timePerStep = decision.elapsed / max(1, stepCount)
-                let interval = actionDelay ?? min(.milliseconds(400), max(.milliseconds(180), timePerStep))
+                    let stepCount = steps.reduce(0) { $0 + $1.count }
+                    let timePerStep = decision.elapsed / actionCount / max(1, stepCount)
+                    let interval = actionDelay ?? min(.milliseconds(400), max(.milliseconds(180), timePerStep))
 
-                if receipt.finished {
-                    try await play(steps, reply: reply, historyEvents: historyEvents, every: interval, nextActionAt: &nextActionAt, run: id)
-                    return
-                }
+                    if index == decision.calls.count - 1, !receipt.finished {
+                        // Only the last batch can overlap with planning. Later calls in this turn
+                        // need the actual world and history produced by playback.
+                        let nextTurn = ModelTurn.result(replies)
+                        async let next = Self.chooseTools(nextTurn, using: model)
+                        try await play(steps, reply: reply, historyEvents: historyEvents,
+                                       every: interval, nextActionAt: &nextActionAt, run: id)
+                        phase = .awaitingModel
+                        exportState()
+                        decision = try await next
+                        pendingVision.removeAll()
+                        continue turns
+                    }
 
-                // Plan from the deterministic result while applying each staged step on screen.
-                async let next = Self.chooseTool(.result(reply), using: model)
-                try await play(steps, reply: reply, historyEvents: historyEvents, every: interval, nextActionAt: &nextActionAt, run: id)
-                phase = .awaitingModel
-                exportState()
-                decision = try await next
+                    try await play(steps, reply: reply, historyEvents: historyEvents,
+                                   every: interval, nextActionAt: &nextActionAt, run: id)
+                    if receipt.finished { return }
+                }
+                decision = try await Self.chooseTools(.result(replies), using: model)
+                pendingVision.removeAll()
             }
         } catch {
-            pendingVision?.update(Task.isCancelled ? .cancelled : .failed)
+            for vision in pendingVision { vision.update(Task.isCancelled ? .cancelled : .failed) }
             if runID == id, !Task.isCancelled {
                 completion = "failed"
                 issue = error.localizedDescription
@@ -250,14 +265,15 @@ final class GameSession {
         }
     }
 
-    private nonisolated static func chooseTool(
+    private nonisolated static func chooseTools(
         _ turn: ModelTurn, using model: any CharacterModel
-    ) async throws -> (call: ToolCall, elapsed: Duration) {
+    ) async throws -> (calls: [ToolCall], elapsed: Duration) {
         try Task.checkCancellation()
         let clock = ContinuousClock()
         let start = clock.now
-        let call = try await model.chooseTool(turn)
-        return (call, start.duration(to: clock.now))
+        let calls = try await model.chooseTools(turn)
+        guard !calls.isEmpty else { throw ModelAPIError.noToolCall(nil) }
+        return (calls, start.duration(to: clock.now))
     }
 
     private func applyMemory(_ call: ToolCall) -> MemoryReceipt.Update {
