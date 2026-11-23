@@ -7,6 +7,30 @@ struct CharacterMessage: Identifiable, Encodable {
     let text: String
 }
 
+struct ToolActivity: Identifiable {
+    let id: Int
+    let function: ToolCall.Function
+    let tool: CharacterTool?
+    var summary = "Running"
+    var needsAttention = false
+
+    mutating func finish(_ receipt: ToolReceipt) {
+        if let failure = receipt.results.first(where: { !$0.success }) {
+            summary = failure.rawValue.replacingOccurrences(of: "_", with: " ").capitalized
+            needsAttention = true
+        } else {
+            switch tool {
+            case .act: summary = receipt.results.count == 1 ? "1 action" : "\(receipt.results.count) actions"
+            case .query: summary = receipt.results.count == 1 ? "1 query" : "\(receipt.results.count) queries"
+            case .vision: summary = "Frame captured"
+            case .memory: summary = receipt.memory?.update == .applied ? "Memory updated" : "Unchanged"
+            case nil: summary = "Unknown tool"
+            }
+        }
+        if receipt.skipped > 0 { summary += " · \(receipt.skipped) skipped" }
+    }
+}
+
 @MainActor
 @Observable
 final class GameSession {
@@ -94,6 +118,7 @@ final class GameSession {
 
     private(set) var world = World()
     private(set) var messages: [CharacterMessage] = []
+    private(set) var toolActivity: [ToolActivity] = []
     private(set) var visionCalls: [VisionCall] = []
     private(set) var notebook = ""
     private(set) var memoryEntries: [String: String] = [:]
@@ -161,6 +186,7 @@ final class GameSession {
         endRun(reason: "reset")
         world = World()
         messages.removeAll()
+        toolActivity.removeAll()
         visionCalls.removeAll()
         notebook = ""
         memoryEntries.removeAll()
@@ -174,6 +200,10 @@ final class GameSession {
     private func endRun(reason: String) {
         guard let runID else { return }
         debugExport?.event("run_ended", RunEnd(runID: runID, reason: reason, batch: batchProgress))
+        if let last = toolActivity.indices.last, toolActivity[last].summary == "Running" {
+            toolActivity[last].summary = "Interrupted"
+            toolActivity[last].needsAttention = true
+        }
         commitHistory()
         self.runID = nil
         isRunning = false
@@ -212,10 +242,13 @@ final class GameSession {
                 let actionCount = decision.calls.count { $0.tool == .act }
                 for (index, call) in decision.calls.enumerated() {
                     try checkRun(id)
+                    let activityIndex = toolActivity.count
+                    toolActivity.append(ToolActivity(id: activityIndex + 1, function: call.function, tool: call.tool))
                     if call.tool != .act {
                         phase = .awaitingModel
                         batchProgress = nil
                         let reply = handleTool(call, visionEnabled: model.visionEnabled, run: id)
+                        toolActivity[activityIndex].finish(reply.receipt)
                         replies.append(reply)
                         if let vision = reply.vision { pendingVision.append(vision) }
                         exportState()
@@ -242,6 +275,8 @@ final class GameSession {
                         async let next = Self.chooseTools(nextTurn, using: model)
                         try await play(steps, reply: reply, historyEvents: historyEvents,
                                        every: interval, nextActionAt: &nextActionAt, run: id)
+                        try checkRun(id)
+                        toolActivity[activityIndex].finish(receipt)
                         phase = .awaitingModel
                         exportState()
                         decision = try await next
@@ -251,6 +286,8 @@ final class GameSession {
 
                     try await play(steps, reply: reply, historyEvents: historyEvents,
                                    every: interval, nextActionAt: &nextActionAt, run: id)
+                    try checkRun(id)
+                    toolActivity[activityIndex].finish(receipt)
                     if receipt.finished { return }
                 }
                 decision = try await Self.chooseTools(.result(replies), using: model)

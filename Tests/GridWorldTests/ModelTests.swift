@@ -488,6 +488,8 @@ func multipleToolCallsRunInOrderAndReturnOneReceiptPerCall() async throws {
     await (try #require(game.task)).value
 
     #expect(game.issue == nil)
+    #expect(game.toolActivity.map(\.function.name) == ["memory", "vision", "act", "vision", "query", "act", "act"])
+    #expect(game.toolActivity.map(\.summary) == ["Memory updated", "Frame captured", "1 action", "Frame captured", "1 query", "1 action", "1 action"])
     #expect(game.notebook == "Remember the route")
     #expect(game.messages.map(\.text) == ["Moved east"])
     #expect(game.visionCalls.map(\.status) == [.sent, .sent, .sent])

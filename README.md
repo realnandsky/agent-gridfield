@@ -14,7 +14,7 @@ Give an agent a goal and watch it gather resources, craft, and build in a small 
 
 1. Download the macOS ZIP from this repository’s Releases page, unzip it, and open `GridWorld.app`.
 2. Open **Settings** (⌘,) and save your API key. The default configuration uses OpenAI with `gpt-5-mini`. You can also configure a Chat Completions-compatible endpoint with function tool support.
-3. Keep the default house-building goal or enter your own, then click **Start**. The map shows each action as it happens. The **Activity** panel shows what the character says.
+3. Keep the default house-building goal or enter your own, then click **Start**. The map shows each action as it happens. In **Activity**, select a tool call to inspect its arguments, or switch to **Messages** to read what the character says.
 
 Use **Stop** to interrupt a run. Starting again uses the current map and inventory. Reopening the app starts a fresh world.
 

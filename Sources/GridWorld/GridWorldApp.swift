@@ -82,7 +82,7 @@ private struct GameView: View {
             }
             worldPane
             Divider()
-            GameActivity(messages: session.messages)
+            GameActivity(messages: session.messages, calls: session.toolActivity)
         }
         .padding(18)
         .frame(minWidth: 640, minHeight: 480)
@@ -201,36 +201,59 @@ private struct GameView: View {
     }
 }
 
-private struct GameActivity: View {
+struct GameActivity: View {
     let messages: [CharacterMessage]
+    let calls: [ToolActivity]
+    @ViewState private var showsCalls = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("Activity")
-                .font(.headline)
-                .accessibilityAddTraits(.isHeader)
+            HStack {
+                Text("Activity")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Picker("Activity feed", selection: $showsCalls) {
+                    Text("Tool calls (\(calls.count))").tag(true)
+                    Text("Messages (\(messages.count))").tag(false)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .fixedSize()
+            }
 
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        if messages.isEmpty {
-                            Text("No character messages yet.")
-                                .foregroundStyle(.secondary)
-                        }
-                        ForEach(messages) { message in
-                            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                                Text(verbatim: message.sender).fontWeight(.semibold)
-                                Text(verbatim: message.text)
-                                    .textSelection(.enabled)
+                        if showsCalls {
+                            if calls.isEmpty {
+                                Label("Tool calls will appear when the agent acts.", systemImage: "wrench.and.screwdriver")
+                                    .foregroundStyle(.secondary)
                             }
-                            .accessibilityElement(children: .combine)
-                            .id(message.id)
+                            ForEach(calls) { call in
+                                ToolActivityRow(activity: call)
+                            }
+                        } else {
+                            if messages.isEmpty {
+                                Text("No character messages yet.")
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(messages) { message in
+                                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                    Text(verbatim: message.sender).fontWeight(.semibold)
+                                    Text(verbatim: message.text)
+                                        .textSelection(.enabled)
+                                }
+                                .accessibilityElement(children: .combine)
+                                .id(message.id)
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(9)
                 }
-                .onChange(of: messages.last?.id, initial: true) { _, latest in
+                .onChange(of: showsCalls ? calls.last.map { AnyHashable($0.id) } : messages.last.map { AnyHashable($0.id) }, initial: true) { _, latest in
                     if let latest { proxy.scrollTo(latest, anchor: .bottom) }
                 }
             }
@@ -242,6 +265,62 @@ private struct GameActivity: View {
                     .strokeBorder(Color(nsColor: .separatorColor))
                     .allowsHitTesting(false)
             }
+        }
+    }
+}
+
+private struct ToolActivityRow: View {
+    let activity: ToolActivity
+    @ViewState private var showArguments = false
+
+    private var symbol: String {
+        switch activity.tool {
+        case .act: "figure.walk"
+        case .memory: "book.closed"
+        case .vision: "eye"
+        case .query: "magnifyingglass"
+        case nil: "wrench"
+        }
+    }
+
+    var body: some View {
+        Button { showArguments.toggle() } label: {
+            HStack(spacing: 9) {
+                Text("#\(activity.id)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Image(systemName: symbol)
+                    .frame(width: 22, height: 22)
+                    .foregroundStyle(Color.accentColor)
+                    .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 5))
+                Text(verbatim: activity.function.name)
+                    .font(.system(.callout, design: .monospaced).weight(.medium))
+                    .lineLimit(1)
+                Spacer()
+                if activity.needsAttention { Image(systemName: "exclamationmark.circle") }
+                Text(activity.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Inspect call arguments")
+        .popover(isPresented: $showArguments) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("\(activity.function.name) · Call #\(activity.id)").font(.headline)
+                ScrollView {
+                    Text(verbatim: activity.function.arguments)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 180)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(width: 320)
         }
     }
 }
