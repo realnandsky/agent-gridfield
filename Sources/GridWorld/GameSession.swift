@@ -13,15 +13,16 @@ struct ToolActivity: Identifiable {
     let tool: CharacterTool?
     var summary = "Running"
     var needsAttention = false
+    var planFailure: PlanFailure?
 
     mutating func finish(_ receipt: ToolReceipt) {
         if let failure = receipt.results.first(where: { !$0.success }) {
             summary = failure.rawValue.replacingOccurrences(of: "_", with: " ").capitalized
             needsAttention = true
+            planFailure = receipt.plans?.compactMap(\.failure).first
         } else {
             switch tool {
             case .act: summary = receipt.results.count == 1 ? "1 action" : "\(receipt.results.count) actions"
-            case .query: summary = receipt.results.count == 1 ? "1 query" : "\(receipt.results.count) queries"
             case .vision: summary = "Frame captured"
             case .memory: summary = receipt.memory?.update == .applied ? "Memory updated" : "Unchanged"
             case nil: summary = "Unknown tool"
@@ -37,6 +38,7 @@ final class GameSession {
     private enum PlaybackStep {
         case world(World)
         case walk(World)
+        case planned(World, HistoryEvent)
         case message(String)
     }
 
@@ -84,6 +86,14 @@ final class GameSession {
         let index: Int
         let step: Int
         let avatar: [Int]
+    }
+
+    private struct PlanStepEvent: Encodable {
+        let runID: UUID
+        let toolCallID: String
+        let index: Int
+        let step: Int
+        let action: HistoryEvent
     }
 
     private struct RunEnd: Encodable {
@@ -337,8 +347,6 @@ final class GameSession {
     private func handleTool(_ call: ToolCall, visionEnabled: Bool, run id: UUID) -> ToolReply {
         let history = recentHistory.batches.isEmpty ? nil : recentHistory.batches
         var results: [ActionOutcome] = []
-        var skipped = 0
-        var queries: [ToolReceipt.Query] = []
         var update: MemoryReceipt.Update?
         var vision: VisionCall?
         switch call.tool {
@@ -349,24 +357,6 @@ final class GameSession {
             case .applied: results = [.memoryUpdated]
             case .unchanged: results = [.inspected]
             case .invalid, .tooLarge: results = [.invalidArguments]
-            }
-        case .query:
-            if let batch = try? call.decode(QueryBatch.self), !batch.queries.isEmpty {
-                var events: [HistoryEvent] = []
-                for (index, query) in batch.queries.enumerated() {
-                    let result = query.result(in: world, at: index)
-                    events.append(HistoryEvent(query: query, result: result, from: world.avatar))
-                    guard let result else {
-                        results.append(.invalidArguments)
-                        break
-                    }
-                    queries.append(result)
-                    results.append(.inspected)
-                }
-                skipped = batch.queries.count - results.count
-                recentHistory.append(events)
-            } else {
-                results = [.invalidArguments]
             }
         case .vision:
             let frame: VisionFrame?
@@ -389,8 +379,8 @@ final class GameSession {
             results = [.unknownTool]
         }
         let receipt = ToolReceipt(
-            results: results, skipped: skipped, observation: world.observation(notebook: notebook),
-            queries: queries.isEmpty ? nil : queries, memory: MemoryReceipt(entries: memoryEntries, update: update),
+            results: results, skipped: 0, observation: world.observation(notebook: notebook),
+            memory: MemoryReceipt(entries: memoryEntries, update: update),
             recentHistory: history
         )
         debugExport?.event("tool_processed", ToolEvent(runID: id, call: call,
@@ -421,6 +411,7 @@ final class GameSession {
         var steps: [[PlaybackStep]] = []
         var results: [ActionOutcome] = []
         var walks: [ToolReceipt.Walk] = []
+        var plans: [ToolReceipt.Plan] = []
         var historyEvents: [HistoryEvent?] = []
         for (index, action) in batch.actions.enumerated() {
             let avatarBefore = projectedWorld.avatar
@@ -452,6 +443,12 @@ final class GameSession {
                 outcome = interaction.outcome
                 actionSteps = interaction.walked.map(PlaybackStep.walk)
                 if outcome.success { actionSteps.append(.world(projectedWorld)) }
+            case .acquire, .buildBlueprint:
+                let plan = preparePlan(action, startingAt: projectedWorld)
+                projectedWorld = plan.world
+                actionSteps = plan.steps
+                outcome = plan.outcome
+                plans.append(.init(index: index, steps: actionSteps.count, failure: plan.failure))
             case .say(let text):
                 actionSteps.append(.message(text))
                 outcome = .messageSent
@@ -467,9 +464,45 @@ final class GameSession {
             results: results, skipped: batch.actions.count - results.count,
             observation: projectedWorld.observation(notebook: notebook),
             walks: walks.isEmpty ? nil : walks,
+            plans: plans.isEmpty ? nil : plans,
             memory: memory, recentHistory: history
         )
         return (steps, receipt, historyEvents)
+    }
+
+    private func preparePlan(_ action: CharacterAction, startingAt initial: World)
+        -> (world: World, steps: [PlaybackStep], outcome: ActionOutcome, failure: PlanFailure?) {
+        var plan = WorldPlan(world: initial)
+        let success: ActionOutcome
+        let failure: PlanFailure?
+        switch action {
+        case .acquire(let item, let count):
+            success = .acquired
+            failure = AcquisitionPlanner.provision([item: count], in: &plan)
+        case .buildBlueprint(let placements):
+            success = .built
+            failure = BlueprintPlanner.build(placements, in: &plan)
+        default:
+            return (initial, [], .invalidArguments, nil)
+        }
+        if let failure { return (initial, [], failure.outcome, failure) }
+
+        var playback = initial
+        var steps: [PlaybackStep] = []
+        for primitive in plan.actions {
+            let avatar = playback.avatar
+            let outcome = playback.apply(primitive)
+            guard outcome.success else {
+                let failure = PlanFailure(outcome, "A planned action could not be executed.", position: avatar)
+                return (initial, [], outcome, failure)
+            }
+            if case .move = primitive {
+                steps.append(.walk(playback))
+            } else if let event = HistoryEvent(action: .world(primitive), result: outcome, from: avatar) {
+                steps.append(.planned(playback, event))
+            }
+        }
+        return (playback, steps, success, nil)
     }
 
     private func play(
@@ -489,6 +522,11 @@ final class GameSession {
                     self.world = world
                     debugExport?.event("walk_step", WalkStepEvent(runID: id, toolCallID: reply.call.id,
                                        index: index, step: stepIndex + 1, avatar: [world.avatar.x, world.avatar.y]))
+                    if stepIndex + 1 < steps[index].count { exportState() }
+                case .planned(let world, let action):
+                    self.world = world
+                    debugExport?.event("plan_step", PlanStepEvent(runID: id, toolCallID: reply.call.id,
+                                       index: index, step: stepIndex + 1, action: action))
                     if stepIndex + 1 < steps[index].count { exportState() }
                 case .message(let text):
                     messages.append(CharacterMessage(sender: "Character", text: text))

@@ -2,7 +2,7 @@
 
 A simple, beautiful open-source sandbox for AI agents.
 
-Give an agent a goal and watch it gather resources, craft, and build in a small grid world. Open Developer Tools to inspect its API requests, tool calls, notebook, and the maps it asks to see.
+Give an agent a goal and watch it gather resources, craft, and build one step at a time in a small grid world. The agent can design a blueprint, then let the game clear the site, gather materials, plan the build, and join adjacent walls. Open Developer Tools to inspect its API requests, tool calls, notebook, and the maps it asks to see.
 
 ![The agent gathers materials and builds a house. Developer Tools shows the final tool call and the map sent to the agent.](docs/demo.gif)
 

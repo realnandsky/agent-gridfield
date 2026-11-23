@@ -66,14 +66,14 @@ enum Recipe: String, CaseIterable, Sendable {
 }
 
 enum Structure: String, CaseIterable, Decodable, Sendable {
-    case floor
+    case floor, wall
     case wallNS = "wall_ns", wallEW = "wall_ew"
     case cornerNE = "corner_ne", cornerSE = "corner_se", cornerSW = "corner_sw", cornerNW = "corner_nw"
     case grassBed = "grass_bed"
 
     var wallArms: [Direction] {
         switch self {
-        case .floor, .grassBed: []
+        case .floor, .wall, .grassBed: []
         case .wallNS: [.north, .south]
         case .wallEW: [.east, .west]
         case .cornerNE: [.north, .east]
@@ -86,6 +86,7 @@ enum Structure: String, CaseIterable, Decodable, Sendable {
     var mapID: String {
         switch self {
         case .floor: "fl"
+        case .wall: "w"
         case .grassBed: "bed"
         case .wallNS: "wns"
         case .wallEW: "wew"
@@ -96,7 +97,7 @@ enum Structure: String, CaseIterable, Decodable, Sendable {
         }
     }
 
-    var blocksMovement: Bool { !wallArms.isEmpty }
+    var blocksMovement: Bool { self == .wall || !wallArms.isEmpty }
     var item: Item { self == .grassBed ? .grassBed : .plank }
 }
 
@@ -121,7 +122,7 @@ enum WorldAction: Sendable {
 
 enum ActionOutcome: String, Codable, Sendable {
     case moved, arrived, collected, dropped, finished, inspected
-    case crafted, placed
+    case crafted, placed, acquired, built
     case messageSent = "message_sent"
     case memoryUpdated = "memory_updated"
     case visionUnavailable = "vision_unavailable"
@@ -134,7 +135,7 @@ enum ActionOutcome: String, Codable, Sendable {
 
     var success: Bool {
         switch self {
-        case .moved, .arrived, .collected, .dropped, .crafted, .placed,
+        case .moved, .arrived, .collected, .dropped, .crafted, .placed, .acquired, .built,
              .messageSent, .memoryUpdated, .finished, .inspected: true
         case .boundary, .waterBlocked, .treeBlocked, .blockUnavailable, .itemAbsent, .itemNotCarried,
              .invalidArguments, .unknownTool, .visionUnavailable, .wallBlocked, .buildBlocked, .occupied, .missingIngredients,
@@ -234,10 +235,11 @@ struct World: Equatable, Sendable {
     let width = 17
     let height = 12
     private(set) var avatar = Position(x: 8, y: 5)
-    private(set) var inventory: [Item: Int] = [:]
+    private(set) var inventory: [Item: Int]
     private var tiles: [Tile]
 
-    init(bushCount: Int = 12) {
+    init(bushCount: Int = 12, inventory: [Item: Int] = [:]) {
+        self.inventory = inventory
         let treeColumns: [[Int]] = [
             [9], [10], [8, 11], [10, 12], [8, 12], [11],
             [10], [7, 10, 11], [7, 9, 11], [], [], [],
@@ -280,6 +282,15 @@ struct World: Equatable, Sendable {
         return tiles[index]
     }
 
+    func wallArms(at position: Position) -> [Direction] {
+        guard let wall = tile(at: position)?.fixture, wall.blocksMovement else { return [] }
+        return Direction.allCases.filter { direction in
+            let neighbor = tile(at: position.neighbor(direction))?.fixture
+            if wall == .wall { return neighbor?.blocksMovement == true }
+            return wall.wallArms.contains(direction) || neighbor == .wall
+        }
+    }
+
     func observation(notebook: String = "") -> WorldObservation {
         let view = stride(from: 0, to: tiles.count, by: width).map { start in
             Array(tiles[start..<(start + width)])
@@ -306,19 +317,22 @@ struct World: Equatable, Sendable {
             return route.reversed()
         }
 
-        func closestStand(to target: Position) -> (position: Position, facing: Direction, distance: Int)? {
+        func closestStand(to target: Position, allowing: (Position) -> Bool = { _ in true })
+            -> (position: Position, facing: Direction, distance: Int)? {
             var closest: (position: Position, facing: Direction, distance: Int)?
             for direction in Direction.allCases {
                 let stand = target.neighbor(direction)
-                guard let distance = distance(to: stand), distance < (closest?.distance ?? Int.max) else { continue }
+                guard allowing(stand), let distance = distance(to: stand),
+                      distance < (closest?.distance ?? Int.max) else { continue }
                 closest = (stand, direction.opposite, distance)
             }
             return closest
         }
     }
 
-    func reachability() -> Reachability {
-        var queue = [avatar]
+    func reachability(from start: Position? = nil, avoiding blocked: Set<Position> = []) -> Reachability {
+        let start = start ?? avatar
+        var queue = [start]
         var next = 0
         var arrivals: [Position: (from: Position, direction: Direction, distance: Int)] = [:]
         while next < queue.count {
@@ -327,36 +341,66 @@ struct World: Equatable, Sendable {
             let distance = arrivals[position]?.distance ?? 0
             for direction in Direction.allCases {
                 let neighbor = position.neighbor(direction)
-                guard neighbor != avatar, arrivals[neighbor] == nil,
+                guard neighbor != start, arrivals[neighbor] == nil, !blocked.contains(neighbor),
                       movementOutcome(to: neighbor) == .moved else { continue }
                 arrivals[neighbor] = (position, direction, distance + 1)
                 queue.append(neighbor)
             }
         }
-        return Reachability(start: avatar, arrivals: arrivals)
+        return Reachability(start: start, arrivals: arrivals)
     }
 
     func shortestRoute(to destination: Position) -> [Direction]? {
         reachability().route(to: destination)
     }
 
+    func firstTreeForAccess(to stands: [Position]) -> Position? {
+        guard !stands.isEmpty else { return nil }
+        struct Route {
+            let cost: Int
+            let firstTree: Position?
+        }
+        let targets = Set(stands)
+        // A cut costs more than walking across the entire map, so walking breaks ties between routes.
+        let treeCost = width * height
+        var costs = [avatar: 0]
+        var frontier = [avatar: Route(cost: 0, firstTree: nil)]
+        while let (position, route) = frontier.min(by: {
+            ($0.value.cost, $0.key.y, $0.key.x) < ($1.value.cost, $1.key.y, $1.key.x)
+        }) {
+            frontier.removeValue(forKey: position)
+            if targets.contains(position) { return route.firstTree }
+            for direction in Direction.allCases {
+                let next = position.neighbor(direction)
+                let outcome = movementOutcome(to: next)
+                guard outcome == .treeBlocked || outcome == .moved else { continue }
+                let isTree = outcome == .treeBlocked
+                let cost = route.cost + 1 + (isTree ? treeCost : 0)
+                guard cost < costs[next, default: .max] else { continue }
+                costs[next] = cost
+                frontier[next] = Route(cost: cost, firstTree: route.firstTree ?? (isTree ? next : nil))
+            }
+        }
+        return nil
+    }
+
     mutating func interact(at target: Position, standingAt requestedStand: Position? = nil,
                            action: (Direction) -> WorldAction)
-        -> (outcome: ActionOutcome, walked: [World]) {
-        guard tile(at: target) != nil else { return (.boundary, []) }
+        -> (outcome: ActionOutcome, walked: [World], actions: [WorldAction]) {
+        guard tile(at: target) != nil else { return (.boundary, [], []) }
         let reachable = reachability()
         let stand: (position: Position, facing: Direction)
         if let requestedStand {
             guard tile(at: requestedStand) != nil,
                   let side = Direction.allCases.first(where: { target.neighbor($0) == requestedStand }) else {
-                return (.invalidArguments, [])
+                return (.invalidArguments, [], [])
             }
             stand = (requestedStand, side.opposite)
         } else {
-            guard let nearest = reachable.closestStand(to: target) else { return (.unreachable, []) }
+            guard let nearest = reachable.closestStand(to: target) else { return (.unreachable, [], []) }
             stand = (nearest.position, nearest.facing)
         }
-        guard let route = reachable.route(to: stand.position) else { return (.unreachable, []) }
+        guard let route = reachable.route(to: stand.position) else { return (.unreachable, [], []) }
 
         var projected = self
         var walked: [World] = []
@@ -364,18 +408,11 @@ struct World: Equatable, Sendable {
             _ = projected.apply(.move(direction))
             walked.append(projected)
         }
-        let outcome = projected.apply(action(stand.facing))
-        guard outcome.success else { return (outcome, []) }
+        let interaction = action(stand.facing)
+        let outcome = projected.apply(interaction)
+        guard outcome.success else { return (outcome, [], []) }
         self = projected
-        return (outcome, walked)
-    }
-
-    func suppliedForPreview(_ required: [Item: Int]) -> World {
-        var copy = self
-        for (item, count) in required {
-            copy.inventory[item] = max(count, inventory[item, default: 0])
-        }
-        return copy
+        return (outcome, walked, route.map(WorldAction.move) + [interaction])
     }
 
     mutating func apply(_ action: WorldAction) -> ActionOutcome {

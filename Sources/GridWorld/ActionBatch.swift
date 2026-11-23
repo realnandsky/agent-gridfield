@@ -4,6 +4,7 @@ enum CharacterActionName: String, CaseIterable {
     case move, collect, drop, craft, place, say
     case collectAt = "collect_at", placeAt = "place_at"
     case walkTo = "walk_to", finish
+    case acquire, buildBlueprint = "build_blueprint"
 }
 
 enum CharacterAction: Decodable, Sendable {
@@ -11,6 +12,8 @@ enum CharacterAction: Decodable, Sendable {
     case walkTo(Position)
     case collectAt(Position, CollectTarget, count: Int = 1)
     case placeAt(Position, Structure, stand: Position? = nil)
+    case acquire(Item, count: Int)
+    case buildBlueprint([BlueprintPlacement])
     case say(String)
     case invalid
 
@@ -98,6 +101,20 @@ enum CharacterAction: Decodable, Sendable {
             } catch {
                 self = .invalid
             }
+        case .acquire:
+            guard count == 3, let amount = value(Int.self, "count"), amount > 0,
+                  let item = string("item").flatMap(Item.init(rawValue:)) else {
+                self = .invalid
+                return
+            }
+            self = .acquire(item, count: amount)
+        case .buildBlueprint:
+            guard count == 2, let placements = value([BlueprintPlacement].self, "placements"),
+                  !placements.isEmpty else {
+                self = .invalid
+                return
+            }
+            self = .buildBlueprint(placements)
         case .drop:
             guard count == 3, let direction,
                   let item = string("item").flatMap(Item.init(rawValue:)) else {
@@ -173,19 +190,17 @@ struct ToolReceipt: Encodable, Sendable {
         let steps: Int
     }
 
-    struct Query: Encodable, Sendable {
+    struct Plan: Encodable, Sendable {
         let index: Int
-        var resources: [ResourceCandidate]?
-        var materials: MaterialEstimate?
-        var preview: BlueprintPreview?
-        var sites: [BuildSite]?
+        let steps: Int
+        let failure: PlanFailure?
     }
 
     let results: [ActionOutcome]
     let skipped: Int
     let observation: WorldObservation
     var walks: [Walk]? = nil
-    var queries: [Query]? = nil
+    var plans: [Plan]? = nil
     var memory: MemoryReceipt? = nil
     var recentHistory: [[HistoryEvent]]? = nil
 

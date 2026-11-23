@@ -196,7 +196,7 @@ import Testing
     #expect(world.apply(.craft(.plank, count: 2)) == .crafted)
     #expect(world.inventory == [.plank: 8])
 
-    var highInventory = world.suppliedForPreview([.log: .max])
+    var highInventory = World(bushCount: 0, inventory: [.log: .max, .plank: 8])
     let beforeOverflow = highInventory
     #expect(highInventory.apply(.craft(.plank, count: .max)) == .invalidArguments)
     #expect(highInventory == beforeOverflow)
@@ -326,100 +326,37 @@ func expandMapRow(_ row: String) -> [String] {
     return cells
 }
 
-@Test func blueprintReportsOneSidedWallSeams() {
-    let world = World(bushCount: 0)
-    let edges = [
-        BlueprintPlacement(x: 9, y: 5, structure: .wallEW),
-        BlueprintPlacement(x: 8, y: 6, structure: .wallNS),
-    ]
-    let wrong = world.previewBuild([.init(x: 8, y: 5, structure: .cornerNW)] + edges)
-    #expect(wrong.validLayout)
-    #expect(wrong.wallSeams?.count == 2)
-    #expect(wrong.wallSeams?.map(\.to) == [[8, 6], [9, 5]])
-    let correct = world.previewBuild([.init(x: 8, y: 5, structure: .cornerSE)] + edges)
-    #expect(correct.validLayout)
-    #expect(correct.wallSeams?.isEmpty == true)
-    #expect(world.tile(at: Position(x: 8, y: 5))?.fixture == nil)
+@MainActor
+@Test(.timeLimit(.minutes(1))) func interruptedAcquisitionKeepsOnlyPlayedSteps() async throws {
+    let game = GameSession(actionDelay: .milliseconds(250))
+    let model = AcquireLogsModel()
+    let tree = Position(x: 8, y: 4)
+    game.start(model: model)
+    let firstRun = try #require(game.task)
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(3))
+    while game.world.tile(at: tree)?.terrain == .tree, clock.now < deadline, game.isRunning {
+        try await Task.sleep(for: .milliseconds(5))
+    }
+    game.stop()
+    await firstRun.value
+
+    #expect(game.world.tile(at: tree)?.terrain == .grass)
+    #expect(game.world.tile(at: tree)?.items[.log] == 2)
+    #expect(game.world.inventory[.log] == nil)
+    #expect(game.toolActivity.first?.summary == "Interrupted")
+
+    game.start(model: model)
+    await (try #require(game.task)).value
+    #expect(game.issue == nil)
+    #expect(game.world.inventory[.log] == 2)
+    #expect(game.world.tile(at: tree)?.items[.log] == nil)
 }
 
-@Test func blueprintReportsThePlacementThatCutOffAccess() throws {
-    let world = World(bushCount: 0)
-    let initial = world.observation()
-    var placements: [BlueprintPlacement] = [
-        .init(x: 2, y: 8, structure: .cornerSE),
-        .init(x: 3, y: 8, structure: .wallEW),
-        .init(x: 4, y: 8, structure: .cornerSW),
-        .init(x: 2, y: 9, structure: .wallNS),
-        .init(x: 3, y: 9, structure: .floor),
-        .init(x: 4, y: 9, structure: .wallNS),
-        .init(x: 2, y: 10, structure: .cornerNE),
-        .init(x: 3, y: 10, structure: .wallEW),
-        .init(x: 4, y: 10, structure: .cornerNW),
-    ]
-
-    let preview = world.previewBuild(placements)
-    let failure = try #require(preview.failure)
-    #expect(!preview.validLayout)
-    #expect(failure.index == 8)
-    #expect(failure.position == [4, 10])
-    #expect(failure.reason == .unreachable)
-    #expect(failure.lostAccessAfter?.index == 7)
-
-    placements[7] = .init(x: 3, y: 10, structure: .wallEW, stand: Position(x: 3, y: 11))
-    let fromOutside = world.previewBuild(placements)
-    #expect(fromOutside.validLayout)
-    #expect(fromOutside.failure == nil)
-    #expect(world.observation() == initial)
-}
-
-@Test func blueprintOmitsAccessLossForAnInitiallyUnreachableTarget() throws {
-    let world = World(bushCount: 0)
-    let preview = world.previewBuild([
-        .init(x: 9, y: 5, structure: .floor),
-        .init(x: 13, y: 0, structure: .cornerSE),
-    ])
-
-    let failure = try #require(preview.failure)
-    #expect(failure.index == 1)
-    #expect(failure.reason == .unreachable)
-    #expect(failure.lostAccessAfter == nil)
-}
-
-@Test func blueprintTracksAccessLossAcrossLaterPlacements() throws {
-    let world = World(bushCount: 0)
-    let preview = world.previewBuild([
-        .init(x: 8, y: 9, structure: .cornerSE),
-        .init(x: 8, y: 7, structure: .floor),
-        .init(x: 9, y: 9, structure: .wallEW),
-    ])
-
-    let failure = try #require(preview.failure)
-    #expect(failure.index == 2)
-    #expect(failure.reason == .unreachable)
-    #expect(failure.lostAccessAfter?.index == 0)
-}
-
-@Test func blueprintChecksAccessToTheSpecifiedStand() throws {
-    let world = World(bushCount: 0)
-    let wall = BlueprintPlacement(x: 9, y: 5, structure: .wallEW)
-    let floor = BlueprintPlacement(x: 9, y: 6, structure: .floor, stand: Position(x: 9, y: 5))
-    #expect(world.previewBuild([floor]).validLayout)
-    #expect(world.previewBuild([wall, .init(x: 9, y: 6, structure: .floor)]).validLayout)
-
-    let failure = try #require(world.previewBuild([wall, floor]).failure)
-    #expect(failure.index == 1)
-    #expect(failure.reason == .unreachable)
-    #expect(failure.lostAccessAfter?.index == 0)
-}
-
-@Test func blueprintRejectsANonadjacentStand() throws {
-    let world = World(bushCount: 0)
-    let preview = world.previewBuild([
-        .init(x: 9, y: 5, structure: .wallEW, stand: Position(x: 8, y: 6)),
-    ])
-
-    let failure = try #require(preview.failure)
-    #expect(failure.index == 0)
-    #expect(failure.reason == .invalidArguments)
-    #expect(failure.lostAccessAfter == nil)
+private struct AcquireLogsModel: CharacterModel {
+    func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
+        [ToolCall(id: "logs", type: "function", function: .init(name: "act", arguments: """
+        {"actions":[{"action":"acquire","item":"log","count":2},{"action":"finish"}]}
+        """))]
+    }
 }

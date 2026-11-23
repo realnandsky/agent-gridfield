@@ -350,97 +350,51 @@ func stoppingWalkPreservesOnlyThePlayedSteps() async throws {
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
-func coordinateActionsAndQueriesSeeTheCurrentWorld() async throws {
+func plannedActionsPlayBackInOrderAndFailuresLeaveTheWorldUnchanged() async throws {
     let game = GameSession(actionDelay: .zero)
     let model = ScriptedTools([
-        toolCall("plans", .query, """
-        {"queries":[{"query":"estimate_materials","counts":{"wall_ns":7,"floor":1,"grass_bed":1}},
-         {"query":"find_build_sites","width":3,"height":3,"limit":2},
-         {"query":"find_build_sites","width":3,"height":3,"limit":3,"nonOverlapping":true},
-         {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor","stand":[10,5]},
-                                                {"x":7,"y":5,"structure":"wall_ns"}]}]}
+        ToolCall(id: "obsolete", type: "function", function: .init(name: "query", arguments: "{}")),
+        batchCall("build-and-gather", """
+        [{"action":"build_blueprint","placements":[{"x":8,"y":4,"structure":"floor"},
+                                                   {"x":9,"y":4,"structure":"wall"}]},
+         {"action":"acquire","item":"plank","count":8}]
         """),
-        batchCall("build", """
-        [
-         {"action":"collect_at","x":8,"y":4,"target":"above"},
-         {"action":"collect_at","x":8,"y":4,"target":"item","item":"log"},
-         {"action":"craft","item":"plank"},
-         {"action":"place_at","x":9,"y":5,"structure":"floor"},
-         {"action":"collect_at","x":11,"y":5,"target":"above"}]
-        """),
-        toolCall("resources", .query, #"{"queries":[{"query":"find_resources","resource":"log","limit":1}]}"#),
         batchCall("blocked", """
-        [{"action":"place_at","x":8,"y":2,"structure":"wall_ns"},
+        [{"action":"build_blueprint","placements":[{"x":9,"y":5,"structure":"floor"},
+                                                   {"x":0,"y":0,"structure":"wall"}]},
          {"action":"say","text":"Skipped"}]
         """),
         batchCall("finish", #"[{"action":"finish"}]"#),
     ])
     game.start(model: model)
     await (try #require(game.task)).value
-    let replies = await model.replies
-    try #require(replies.count == 4)
-    #expect(replies[0].receipt.results == [.inspected, .inspected, .inspected, .inspected])
-    #expect(replies[1].receipt.results == [.collected, .collected, .crafted, .placed, .collected])
-    #expect(replies[2].receipt.results == [.inspected])
-    #expect(replies[3].receipt.results == [.buildBlocked])
-    #expect(replies[3].receipt.skipped == 1)
-    let queries = try #require(replies[0].receipt.queries)
-    try #require(queries.map(\.index) == [0, 1, 2, 3])
-    #expect(queries[0].materials?.missing == ["log": 3, "grass": 2])
-    #expect(queries[0].materials?.crafts == ["plank": 3, "grass_bed": 1])
-    #expect(queries[1].sites?.count == 2)
-    let siteOrigins = try #require(queries[2].sites).map(\.origin)
-    try #require(siteOrigins.count == 3)
-    for (index, origin) in siteOrigins.enumerated() {
-        for other in siteOrigins.dropFirst(index + 1) {
-            #expect(abs(origin[0] - other[0]) >= 3 || abs(origin[1] - other[1]) >= 3)
-        }
-    }
-    #expect(queries[3].preview?.validLayout == false)
-    #expect(queries[3].preview?.failure?.index == 1)
-    #expect(queries[3].preview?.failure?.position == [7, 5])
-    let resource = replies[2].receipt.queries?.first?.resources?.first
-    #expect(resource?.position == [11, 5])
-    #expect(resource?.stand == [10, 5])
-    #expect(resource?.steps == 0)
-    #expect(game.world.avatar == Position(x: 10, y: 5))
-    #expect(game.world.tile(at: Position(x: 9, y: 5))?.hasFloor == true)
-    #expect(game.world.inventory == [.plank: 3])
+
+    let replies = await model.replies.map(\.receipt)
+    try #require(replies.count == 3)
+    #expect(replies[0].results == [.unknownTool])
+    #expect(replies[1].results == [.built, .acquired])
+    #expect(replies[1].plans?.map(\.index) == [0, 1])
+    #expect(replies[1].plans?.allSatisfy { $0.steps > 0 && $0.failure == nil } == true)
+    #expect(replies[1].observation.inventory["plank", default: 0] >= 8)
+    #expect(replies[2].results.count == 1)
+    #expect(replies[2].results.first?.success == false)
+    #expect(replies[2].plans?.first?.failure?.position == [0, 0])
+    #expect(replies[2].plans?.first?.steps == 0)
+    #expect(replies[2].skipped == 1)
+    #expect(replies[2].observation == replies[1].observation)
+    let blueprintHistory = replies[2].recentHistory?.last?.first
+    #expect(blueprintHistory?.placementCount == 2)
+    #expect(blueprintHistory?.bounds == [[8, 4], [9, 4]])
+    #expect(game.world.tile(at: Position(x: 8, y: 4))?.hasFloor == true)
+    #expect(game.world.tile(at: Position(x: 9, y: 4))?.fixture == .wall)
     #expect(game.messages.isEmpty)
-}
-
-@Test func nonOverlappingBuildSitesMaximizeCountThenPreferEarlierRanks() {
-    let ranked = [2, 0, 4, 7].map { x in
-        BuildSite(origin: [x, 0], entrance: [x, 0], stepsToEntrance: 0, clear: [])
-    }
-    let moreSites = BuildSite.selectNonOverlapping(from: Array(ranked.prefix(3)), width: 3, height: 1, limit: 2)
-    #expect(moreSites.map(\.origin) == [[0, 0], [4, 0]])
-    let earlierRanks = BuildSite.selectNonOverlapping(from: ranked, width: 3, height: 1, limit: 2)
-    #expect(earlierRanks.map(\.origin) == [[2, 0], [7, 0]])
-}
-
-@Test func previewStandRequiresTwoIntegerCoordinates() throws {
-    let query = try decode(QueryBatch.self, """
-        {"queries":[{"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor","stand":[8,5,0]}]}]}
-        """)
-    guard case .invalid = try #require(query.queries.first) else {
-        Issue.record("Expected a preview stand with three coordinates to be rejected")
-        return
-    }
 }
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
-func placeAtUsesThePreviewStandAndHistoryIdentifiesTheBlueprints() async throws {
+func placeAtUsesTheSpecifiedStand() async throws {
     let game = GameSession(actionDelay: .zero)
     let model = ScriptedTools([
-        toolCall("previews", .query, """
-        {"queries":[
-          {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"wall_ew"},
-                                                 {"x":9,"y":6,"structure":"floor","stand":[9,5]}]},
-          {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor","stand":[10,5]}]}
-        ]}
-        """),
         batchCall("prepare", """
         [{"action":"collect","direction":"north","target":"above"},
          {"action":"collect","direction":"north","target":"item","item":"log"},
@@ -455,24 +409,12 @@ func placeAtUsesThePreviewStandAndHistoryIdentifiesTheBlueprints() async throws 
     await (try #require(game.task)).value
 
     let replies = await model.replies.map(\.receipt)
-    try #require(replies.count == 3)
-    let previews = try #require(replies[0].queries)
-    try #require(previews.count == 2)
-    let failure = try #require(previews[0].preview?.failure)
-    #expect(failure.position == [9, 6])
-    #expect(failure.lostAccessAfter?.index == 0)
-    #expect(failure.lostAccessAfter?.position == [9, 5])
-    #expect(previews[1].preview?.validLayout == true)
-    let previewHistory = try #require(replies[1].recentHistory?.last)
-    #expect(previewHistory.map(\.placementCount) == [2, 1])
-    #expect(previewHistory.map(\.bounds) == [[[9, 5], [9, 6]], [[9, 5], [9, 5]]])
-    #expect(previewHistory.first?.query?.preview?.failure?.lostAccessAfter?.position == [9, 5])
-
-    #expect(replies[1].results == [.collected, .collected, .crafted, .unreachable])
-    #expect(replies[1].skipped == 1)
-    #expect(replies[1].observation.avatar == Position(x: 8, y: 5))
-    #expect(replies[1].observation.inventory == ["plank": 4])
-    #expect(replies[2].results == [.placed])
+    try #require(replies.count == 2)
+    #expect(replies[0].results == [.collected, .collected, .crafted, .unreachable])
+    #expect(replies[0].skipped == 1)
+    #expect(replies[0].observation.avatar == Position(x: 8, y: 5))
+    #expect(replies[0].observation.inventory == ["plank": 4])
+    #expect(replies[1].results == [.placed])
     #expect(game.world.avatar == Position(x: 10, y: 5))
     #expect(game.world.tile(at: Position(x: 9, y: 5))?.hasFloor == true)
 }
@@ -522,8 +464,12 @@ func bulkCollectAndCraftUseOneResultPerAction() async throws {
     #"{"action":"craft","item":"plank","count":1.5}"#,
     #"{"action":"collect","direction":"north","target":"item","item":"log","count":-1}"#,
     #"{"action":"collect_at","x":8,"y":4,"target":"above","count":2}"#,
+    #"{"action":"acquire","item":"log"}"#,
+    #"{"action":"acquire","item":"log","count":0}"#,
+    #"{"action":"build_blueprint","placements":[]}"#,
+    #"{"action":"build_blueprint","placements":[{"x":9,"y":5,"structure":"wall","stand":[8,5]}]}"#,
 ])
-func actionArgumentsRejectInvalidStandOrCount(_ action: String) throws {
+func actionArgumentsRejectInvalidFields(_ action: String) throws {
     let batch = try batchCall("invalid", "[\(action)]").decodeBatch()
     guard case .invalid = try #require(batch.actions.first) else {
         Issue.record("Expected invalid arguments for \(action)")
@@ -565,7 +511,7 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
         let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         let tools = try #require(json["tools"] as? [[String: Any]])
         #expect(tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
-                == ["act", "memory", "query", "vision"])
+                == ["act", "memory", "vision"])
         return try #require(json["messages"] as? [[String: Any]])
     }
     #expect(bodies.map(\.count) == [2, 5, 4, 4, 5, 4])
@@ -619,8 +565,8 @@ func multipleToolCallsRunInOrderAndReturnOneReceiptPerCall() async throws {
     await (try #require(game.task)).value
 
     #expect(game.issue == nil)
-    #expect(game.toolActivity.map(\.function.name) == ["memory", "vision", "act", "vision", "query", "act", "act"])
-    #expect(game.toolActivity.map(\.summary) == ["Memory updated", "Frame captured", "1 action", "Frame captured", "1 query", "1 action", "1 action"])
+    #expect(game.toolActivity.map(\.function.name) == ["memory", "vision", "act", "vision", "memory", "act", "act"])
+    #expect(game.toolActivity.map(\.summary) == ["Memory updated", "Frame captured", "1 action", "Frame captured", "Unchanged", "1 action", "1 action"])
     #expect(game.notebook == "Remember the route")
     #expect(game.messages.map(\.text) == ["Moved east"])
     #expect(game.visionCalls.map(\.status) == [.sent, .sent, .sent])
@@ -703,7 +649,7 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
         requests.append(try JSONDecoder().decode(RecordedBody.self, from: data))
     }
     #expect(requests.allSatisfy { $0.parallelToolCalls && !$0.store && $0.model == "test-model" })
-    #expect(requests.allSatisfy { $0.tools.map(\.function.name) == ["act", "memory", "query"] })
+    #expect(requests.allSatisfy { $0.tools.map(\.function.name) == ["act", "memory"] })
     #expect(requests[0].messages.map(\.role) == ["system", "user"])
     let firstTurn = try decode(WirePlayerTurn.self, requests[0].messages[1].content)
     let firstView = try #require(firstTurn.observation)
@@ -729,10 +675,19 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(properties["count"]?.type == "integer")
     #expect(schemas[0].properties?.keys.sorted() == ["actions"])
     #expect(schemas[1].properties?.keys.sorted() == ["remove", "set", "text"])
-    let queryProperties = try #require(schemas[2].properties?["queries"]?.items?.properties)
-    #expect(queryProperties["resource"]?.choices == ResourceKind.allCases.map(\.rawValue))
-    #expect(queryProperties["counts"]?.type == "object")
-    #expect(queryProperties["placements"]?.type == "array")
+    #expect(properties["action"]?.choices?.contains("build_blueprint") == true)
+    #expect(properties["action"]?.choices?.contains("acquire") == true)
+    #expect(properties["count"]?.minimum == 1)
+    let placements = try #require(properties["placements"])
+    #expect(placements.type == "array")
+    #expect(placements.minItems == 1)
+    let placement = try #require(placements.items)
+    #expect(placement.required == ["x", "y", "structure"])
+    #expect(placement.properties?["x"]?.type == "integer")
+    #expect(placement.properties?["y"]?.type == "integer")
+    #expect(placement.properties?["structure"]?.choices == ["wall", "floor", "grass_bed"])
+    #expect(placement.properties?["stand"] == nil)
+    #expect(requests[0].messages[0].content?.contains("preview_build") == false)
     #expect(requests.allSatisfy { $0.toolChoice == "auto" })
     #expect(requests[8].messages[0].content?.contains("previous response used plain text") == true)
     #expect(Array(requests[8].messages.dropFirst().map(\.content)) ==
@@ -1121,9 +1076,12 @@ private struct RecordedBody: Decodable {
         let choices: [String]?
         let properties: [String: Parameter]?
         let items: Parameter?
+        let required: [String]?
+        let minItems: Int?
+        let minimum: Int?
 
         enum CodingKeys: String, CodingKey {
-            case type, properties, items
+            case type, properties, items, required, minItems, minimum
             case choices = "enum"
         }
     }
@@ -1317,7 +1275,7 @@ private final class StubChatEndpoint: URLProtocol, @unchecked Sendable {
                     toolCall("before", .vision, "{}"),
                     batchCall("step", #"[{"action":"move","direction":"east"}]"#),
                     toolCall("after", .vision, "{}"),
-                    toolCall("inspect", .query, #"{"queries":[{"query":"find_resources","resource":"tree"}]}"#),
+                    toolCall("inspect", .memory, "{}"),
                     batchCall("speak", #"[{"action":"say","text":"Moved east"}]"#),
                 ]
                 let encoded = String(decoding: try! JSONEncoder().encode(calls), as: UTF8.self)

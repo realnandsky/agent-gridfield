@@ -38,7 +38,6 @@ struct HistoryEvent: Encodable, Sendable {
     let result: ActionOutcome
     var count: Int? = nil
     var avatar: [Int]? = nil
-    var query: ToolReceipt.Query? = nil
     var placementCount: Int? = nil
     var bounds: [[Int]]? = nil
 
@@ -65,30 +64,17 @@ struct HistoryEvent: Encodable, Sendable {
         case .placeAt(let position, let structure, let stand):
             let standDescription = stand.map { " from \(Self.label($0))" } ?? ""
             description = "place \(structure.rawValue) at \(Self.label(position))\(standDescription)"
+        case .acquire(let item, let count):
+            description = "acquire \(count) \(item.rawValue)"
+        case .buildBlueprint:
+            description = "build_blueprint"
         case .invalid:
             description = "invalid action"
         case .say, .world(.finish):
             return nil
         }
         self.init(action: description, result: result, from: avatar)
-    }
-
-    init(query: WorldQuery, result: ToolReceipt.Query?, from avatar: Position) {
-        let description: String
-        switch query {
-        case .findResources(let resource, _):
-            description = "find_resources \(resource.rawValue)"
-        case .estimateMaterials:
-            description = "estimate_materials"
-        case .previewBuild:
-            description = "preview_build"
-        case .findBuildSites(let width, let height, _, let nonOverlapping):
-            description = "find_build_sites \(width)x\(height)" + (nonOverlapping ? " nonOverlapping" : "")
-        case .invalid:
-            description = "invalid query"
-        }
-        self.init(action: description, result: result == nil ? .invalidArguments : .inspected, from: avatar)
-        if case .previewBuild(let placements) = query, let first = placements.first {
+        if case .buildBlueprint(let placements) = action, let first = placements.first {
             placementCount = placements.count
             var minX = first.x, maxX = first.x
             var minY = first.y, maxY = first.y
@@ -99,16 +85,6 @@ struct HistoryEvent: Encodable, Sendable {
                 maxY = max(maxY, placement.y)
             }
             bounds = [[minX, minY], [maxX, maxY]]
-        }
-        if var result {
-            result.resources = result.resources.map { Array($0.prefix(3)) }
-            result.sites = result.sites.map { Array($0.prefix(3)) }
-            if let preview = result.preview {
-                result.preview = BlueprintPreview(materials: preview.materials, validLayout: preview.validLayout,
-                                                  failure: preview.failure,
-                                                  wallSeams: preview.wallSeams.map { Array($0.prefix(3)) })
-            }
-            self.query = result
         }
     }
 
@@ -139,7 +115,7 @@ struct RecentHistory {
     mutating func append(_ events: [HistoryEvent]) {
         var grouped: [HistoryEvent] = []
         for event in events {
-            if let last = grouped.last, last.query == nil, event.query == nil,
+            if let last = grouped.last, last.placementCount == nil, event.placementCount == nil,
                last.action == event.action, last.result == event.result, last.avatar == event.avatar {
                 grouped[grouped.count - 1].count = (last.count ?? 1) + 1
             } else {
@@ -153,7 +129,7 @@ struct RecentHistory {
         while let data = try? encoder.encode(batches), data.count > Self.byteLimit {
             if batches.count > 1 {
                 batches.removeFirst()
-            } else if let firstRoutine = batches[0].firstIndex(where: { $0.query == nil && $0.result.success }) {
+            } else if let firstRoutine = batches[0].firstIndex(where: { $0.placementCount == nil && $0.result.success }) {
                 batches[0].remove(at: firstRoutine)
             } else {
                 batches[0].removeFirst()

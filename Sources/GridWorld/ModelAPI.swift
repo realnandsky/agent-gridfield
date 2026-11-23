@@ -1,7 +1,7 @@
 import Foundation
 
 enum CharacterTool: String, Sendable {
-    case act, memory, query, vision
+    case act, memory, vision
 }
 
 struct ToolCall: Codable, Equatable, Sendable {
@@ -336,32 +336,43 @@ struct ChatCompletionsModel: CharacterModel {
         memory accepts optional text (replace the notebook, empty string clears it), set (entry ID to text), and remove (entry IDs).
         Entry IDs are nonblank strings. An ID can appear in either set or remove per call. All changes apply together.
         Notebook text is limited to \(MemoryReceipt.notebookByteLimit) UTF-8 bytes; saved IDs and entry text share a separate \(MemoryReceipt.byteLimit)-byte limit.
-        memory({}) returns saved entries and the current observation. recentHistory contains up to four earlier batches of processed actions and queries.
-        Historical preview_build events include placementCount and bounds [[minX,minY],[maxX,maxY]] of all proposed placements. History count groups identical adjacent actions.
+        memory({}) returns saved entries and the current observation. recentHistory contains up to four earlier batches of processed actions. History count groups identical adjacent actions.
+        Historical blueprint events include placementCount and inclusive bounds [[minX,minY],[maxX,maxY]].
 
         [Actions]
         act accepts a nonempty ordered actions array.
-        action     | fields besides action
-        move       | direction
-        walk_to    | x, y (integers)
-        collect    | direction, target (target=item requires item and allows count)
-        collect_at | x, y, target (same item and count rules as collect)
-        place_at   | x, y, structure, optional stand
-        drop       | direction, item
-        craft      | item (recipe name), optional count
-        place      | direction, structure (full type name from legend)
-        say        | text
-        finish    | none
+        action          | fields besides action
+        build_blueprint | placements (nonempty array of {x,y,structure})
+        acquire         | item, count (desired inventory total)
+        walk_to         | x, y (integers)
+        move            | direction
+        collect_at      | x, y, target (target=item requires item and allows count)
+        collect         | direction, target (same item and count rules as collect_at)
+        place_at        | x, y, structure, optional stand
+        place           | direction, structure
+        craft           | item (recipe name), optional count
+        drop            | direction, item
+        say             | text
+        finish          | none
 
+        [Blueprints and inventory targets]
+        build_blueprint accepts final placement positions in any order. Specify each desired wall cell as structure=wall. Walls join at orthogonally adjacent walls and form corners automatically. Other structure values are floor and grass_bed.
+        The engine clears trees and bushes on the footprint, opens access through trees when necessary, gathers or crafts missing materials, and chooses placement order and reachable stands to avoid trapping the avatar. Multiple buildings can share one blueprint. Choose their layout using the observation.
+        A floor and a grass bed can share a tile. Walls require bare ground. Existing matching structures count as placed. Water and conflicting structures block a placement.
+        acquire takes a positive count and counts items already carried toward that total. The engine finds reachable resources and uses recipes as needed. Recipe yields can leave extra items.
+        Both actions plan against the current world and then play the actual movement, collection, crafting and construction. Success yields built or acquired. An infeasible plan leaves the world as it was before that action.
+        receipt.plans lists {index, steps, failure?} for plan actions. index is the zero-based action index. failure contains reason and may include position [x,y], item, needed and available.
+
+        [Direct actions]
         direction = north | south | east | west
         direction target = one cell from the current avatar; out-of-bounds targets fail
         move = step into target; water, trees, walls and corners block movement
         walk_to = follow the shortest four-direction route to the exact [x,y] cell using the same movement rules
-        collect_at and place_at walk to the nearest reachable neighboring cell and perform the action. place_at can specify an exact stand, using the same rules as preview_build
+        collect_at and place_at walk to the nearest reachable neighboring cell and perform the action. place_at can specify an exact stand as [x,y], orthogonally adjacent to the target.
         failed coordinate actions leave the avatar in place
         walk_to results: arrived (including zero steps), boundary (outside the map), unreachable (no route)
         drop = transfer 1 item from inventory to target
-        count is a positive integer, defaults to 1, and applies to the entire action. If there are too few items or ingredients, the action fails without transferring or crafting any.
+        For collect, collect_at and craft, count is a positive integer and defaults to 1. If there are too few items or ingredients, the action fails without transferring or crafting any.
 
         [Collect]
         target | selection    | effect
@@ -378,44 +389,19 @@ struct ChatCompletionsModel: CharacterModel {
         recipe | consume from inventory -> add to inventory
         \(recipeRules)
 
-        [Build]
+        [Placement]
         structure     | required ground  | required above | consume
         floor         | grass            | air or grass_bed | 1 plank
         grass_bed     | grass or floor   | air            | 1 grass_bed
         walls/corners | grass            | air            | 1 plank
-        wall suffix = arms extending from the center of its cell
-        building corners by position: upper-left corner_se (east+south), upper-right corner_sw (south+west),
-        lower-left corner_ne (north+east), lower-right corner_nw (north+west)
-
-        [Queries]
-        query accepts a nonempty queries array; each entry uses the query field to select an operation.
-        Queries read the current world.
-        query              | fields besides query
-        find_resources     | resource, optional limit
-        estimate_materials | counts (object: structure name -> quantity)
-        preview_build     | placements (ordered array of {x,y,structure,stand?})
-        find_build_sites  | width, height, optional limit and nonOverlapping
-        query limit defaults to 3, range 1–10; coordinates and sizes are integers
-        find_resources returns reachable candidates {position, stand, steps, count, target}, nearest first
-        resource tree or bush uses target=above; tree count is logs dropped by felling; pick up logs separately
-        other resources are collectible items; use target=item with item matching the resource
-        estimate_materials returns required finished items, recommended craft batches, and missing raw ingredients after inventory
-        preview_build checks the given placement order with hypothetical materials; returns materials, validLayout and the first failure {index, position, reason} if any
-        stand is an optional exact [x,y] tile orthogonally adjacent to the placement target. Placement fails if the specified stand cannot be reached. If omitted, placement uses the nearest reachable stand.
-        for an unreachable placement with a reachable stand at the start, failure.lostAccessAfter contains the zero-based index and [x,y] position of the earlier placement that cut access
-        after successful simulation, preview.wallSeams lists one-sided connections between adjacent walls as {from, to, direction}; an empty array means none found
-        find_build_sites ranks rectangular footprints by fewest cells to clear then shortest walk to a perimeter entrance
-        nonOverlapping: true returns as many footprints as fit without sharing tiles, up to limit, with rank breaking ties
-        each site has origin (top-left), entrance, stepsToEntrance (assuming entrance cleared), and clear (tree or bush coordinates)
 
         [Turn]
         return one or more available tool calls and leave assistant content empty
         calls execute in the order returned, against the state left by earlier calls
         the next request includes one receipt per call unless finish ends the run first
-        action and query batches stop at the first failure or finish; earlier effects persist
+        action batches stop at the first failure or finish; earlier effects persist
         receipt = results (attempted outcomes in order), skipped (count), observation (final state)
         receipt.walks, when present, lists successful walks as {index, destination: [x,y], steps}; index is zero-based
-        receipt.queries lists {index, resources|materials|preview|sites} for each query, corresponding result = inspected
         say = display nonempty text in game chat
         finish = end the current run
         """
@@ -439,7 +425,7 @@ struct ChatCompletionsModel: CharacterModel {
         }.joined(separator: "\n")
     }
 
-    private static let tools: [ToolDefinition] = [.act, .memory, .query]
+    private static let tools: [ToolDefinition] = [.act, .memory]
 }
 
 private struct PlayerTurn: Encodable {
@@ -559,7 +545,7 @@ private struct ToolDefinition: Encodable, Sendable {
     }
 
     static let act = ToolDefinition(
-        .act, description: "Execute an ordered batch of actions in Agent Gridfield.",
+        .act, description: "Execute physical actions in Agent Gridfield, including building a blueprint and acquiring an inventory target.",
         properties: ["actions": .init(type: "array", items: action, minItems: 1)],
         required: ["actions"]
     )
@@ -570,11 +556,6 @@ private struct ToolDefinition: Encodable, Sendable {
             "set": .init(type: "object", description: "Entry IDs mapped to new text.", valueType: .init()),
             "remove": .init(type: "array", items: .init(), description: "Entry IDs to delete."),
         ]
-    )
-    static let query = ToolDefinition(
-        .query, description: "Inspect resources, materials, build sites or a proposed blueprint in the current world.",
-        properties: ["queries": .init(type: "array", items: queryItem, minItems: 1)],
-        required: ["queries"]
     )
     static let vision = ToolDefinition(
         .vision, description: "Request one coordinate-labeled image of the current Agent Gridfield map. "
@@ -595,26 +576,18 @@ private struct ToolDefinition: Encodable, Sendable {
         "item": .init(values: Item.allCases.map(\.rawValue)),
         "structure": .init(values: Structure.allCases.map(\.rawValue)),
         "stand": stand,
-        "count": .init(type: "integer", description: "Recipe runs for craft or items to collect for target=item. Defaults to 1.", minimum: 1),
+        "count": .init(type: "integer", description: "Required desired inventory total for acquire. For craft and item collection, quantity to process, defaulting to 1.", minimum: 1),
         "text": .init(),
+        "placements": .init(type: "array", items: placement,
+                            description: "Required for build_blueprint. Final tiles in any order.", minItems: 1),
     ], required: ["action"], additionalProperties: false)
 
-    private static let queryItem = Parameter(type: "object", properties: [
-        "query": .init(values: WorldQuery.Name.allCases.map(\.rawValue)),
-        "resource": .init(values: ResourceKind.allCases.map(\.rawValue)),
-        "limit": .init(type: "integer"),
-        "width": .init(type: "integer"),
-        "height": .init(type: "integer"),
-        "nonOverlapping": .init(type: "boolean", description: "Select build sites that share no tiles."),
-        "counts": .init(type: "object", properties: Dictionary(uniqueKeysWithValues:
-            Structure.allCases.map { ($0.rawValue, Parameter(type: "integer")) }), additionalProperties: false),
-        "placements": .init(type: "array", items: .init(type: "object", properties: [
-            "x": .init(type: "integer"),
-            "y": .init(type: "integer"),
-            "structure": .init(values: Structure.allCases.map(\.rawValue)),
-            "stand": stand,
-        ], required: ["x", "y", "structure"], additionalProperties: false)),
-    ], required: ["query"], additionalProperties: false)
+    private static let placement = Parameter(type: "object", properties: [
+        "x": .init(type: "integer"),
+        "y": .init(type: "integer"),
+        "structure": .init(values: [Structure.wall, .floor, .grassBed].map(\.rawValue),
+                           description: "Wall edges join automatically."),
+    ], required: ["x", "y", "structure"], additionalProperties: false)
 
     enum AdditionalProperties: Encodable, Sendable {
         case allowed(Bool)

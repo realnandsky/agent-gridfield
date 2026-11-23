@@ -11,6 +11,12 @@ struct GridWorldApp: App {
     private let debugExportEnabled: Bool
     private let debugLaunchIssue: String?
 
+    private var releaseLabel: String? {
+        let bundle = Bundle.main
+        let prefix = bundle.object(forInfoDictionaryKey: "GridWorldVersionPrefix") as? String ?? ""
+        return (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { prefix + $0 }
+    }
+
     init() {
         let export: DebugExport?
         do {
@@ -27,7 +33,7 @@ struct GridWorldApp: App {
     }
 
     var body: some Scene {
-        Window("Agent Gridfield", id: "world") {
+        Window(releaseLabel.map { "Agent Gridfield · \($0)" } ?? "Agent Gridfield", id: "world") {
             GameView(session: session, debugger: debugger, debugExportEnabled: debugExportEnabled)
                 .safeAreaInset(edge: .top) {
                     if let debugLaunchIssue {
@@ -43,11 +49,8 @@ struct GridWorldApp: App {
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Agent Gridfield") {
-                    let bundle = Bundle.main
-                    let prefix = bundle.object(forInfoDictionaryKey: "GridWorldVersionPrefix") as? String ?? ""
-                    let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
                     let options: [NSApplication.AboutPanelOptionKey: Any] =
-                        version.map { [.applicationVersion: prefix + $0] } ?? [:]
+                        releaseLabel.map { [.applicationVersion: $0] } ?? [:]
                     NSApplication.shared.orderFrontStandardAboutPanel(options: options)
                 }
             }
@@ -278,7 +281,6 @@ private struct ToolActivityRow: View {
         case .act: "figure.walk"
         case .memory: "book.closed"
         case .vision: "eye"
-        case .query: "magnifyingglass"
         case nil: "wrench"
         }
     }
@@ -310,6 +312,16 @@ private struct ToolActivityRow: View {
         .popover(isPresented: $showArguments) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("\(activity.function.name) · Call #\(activity.id)").font(.headline)
+                if let failure = activity.planFailure {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(verbatim: failure.reason)
+                        if let position = failure.position {
+                            Text("Tile (\(position[0]), \(position[1]))").foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.callout)
+                    .textSelection(.enabled)
+                }
                 ScrollView {
                     Text(verbatim: activity.function.arguments)
                         .font(.system(.caption, design: .monospaced))

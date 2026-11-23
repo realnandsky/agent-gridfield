@@ -99,7 +99,7 @@ struct WorldMap: View {
             if fixture == .grassBed {
                 drawBed(in: context)
             } else {
-                drawWall(fixture.wallArms, in: context)
+                drawWall(world.wallArms(at: position), in: context)
             }
         }
 
@@ -151,6 +151,13 @@ struct WorldMap: View {
     }
 
     private func drawWall(_ arms: [Direction], in context: GraphicsContext) {
+        if arms.isEmpty {
+            context.fill(Path(CGRect(x: 0.30, y: 0.30, width: 0.40, height: 0.40)),
+                         with: .color(Color(hex: 0x62412D)))
+            context.fill(Path(CGRect(x: 0.37, y: 0.37, width: 0.26, height: 0.26)),
+                         with: .color(Color(hex: 0xAF7950)))
+            return
+        }
         var context = context
         context.clip(to: Path(CGRect(x: 0, y: 0, width: 1, height: 1)))
         let wall = Path { path in
