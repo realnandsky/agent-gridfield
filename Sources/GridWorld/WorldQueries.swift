@@ -120,16 +120,7 @@ struct BlueprintPlacement: Decodable, Sendable {
         x = try fields.decode(Int.self, forKey: .x)
         y = try fields.decode(Int.self, forKey: .y)
         structure = try fields.decode(Structure.self, forKey: .structure)
-        if fields.contains(.stand) {
-            let coordinates = try fields.decode([Int].self, forKey: .stand)
-            guard coordinates.count == 2 else {
-                throw DecodingError.dataCorruptedError(forKey: .stand, in: fields,
-                                                       debugDescription: "Expected stand coordinates [x, y]")
-            }
-            stand = Position(x: coordinates[0], y: coordinates[1])
-        } else {
-            stand = nil
-        }
+        stand = try fields.decodeStand(forKey: .stand)
     }
 
     private enum CodingKeys: String, CodingKey { case x, y, structure, stand }
@@ -153,6 +144,7 @@ struct BlueprintPreview: Encodable, Sendable {
     struct Failure: Encodable, Sendable {
         struct AccessLoss: Encodable, Sendable {
             let index: Int
+            let position: [Int]
         }
 
         let index: Int
@@ -337,7 +329,7 @@ extension World {
             // The prefix already succeeded. Only a blocking structure can shrink its reachable area.
             _ = replay.previewPlacement(placement)
             if placement.structure.blocksMovement, !canApproach(in: replay) {
-                return .init(index: index)
+                return .init(index: index, position: [placement.x, placement.y])
             }
         }
         return nil

@@ -24,7 +24,7 @@ Open **Notebook** to read the agent's current notes and named entries. Requests 
 
 The same tool can update named entries, for example `{"set":{"idea":"Build a path by the lake"},"remove":["old-plan"]}`. IDs and text share a separate 2,400-byte limit. All changes in one call apply together. Invalid or oversized updates leave the prior values in place. `memory.entries` is included with tool receipts and appears in **Notebook**. A new run in the same world sees saved entries in its first tool receipt.
 
-`recentHistory` covers up to four previous batches of processed actions and queries, with a combined limit of 2,400 JSON bytes. Identical adjacent actions are counted together. Older query results keep at most three resource candidates, sites, or wall seams. The current query receipt contains the full results. Query indices in history refer to their original batches.
+`recentHistory` covers up to four previous batches of processed actions and queries, with a combined limit of 2,400 JSON bytes. Identical adjacent actions are grouped with a `count` of repeated actions. Historical `preview_build` events show `placementCount` and `bounds`, the inclusive minimum and maximum `[x,y]` coordinates across all proposed placements. Older query results keep at most three resource candidates, sites, or wall seams. The current query receipt contains the full results. Query indices in history refer to their original batches.
 
 ### Vision History
 
@@ -75,15 +75,17 @@ The agent submits ordered action batches with `act`. The app validates a batch a
 
 A successful walk yields one `arrived` outcome in `results`. The `walks` array lists its action index, destination, and number of steps. The step count is zero when the agent is already there. A blocked route returns `unreachable`. An out-of-bounds destination returns `boundary`.
 
+`count` is an optional positive integer that defaults to 1. In `craft`, it counts recipe runs. For example, `{"action":"craft","item":"plank","count":3}` uses three logs and produces twelve planks. In `collect` and `collect_at`, it applies to `target: "item"` and counts items collected from the same tile, with loose items taken first. Collection with `target: "above"` or `target: "ground"` acts on one block. If the requested quantity is unavailable, the whole action fails. A failed `collect_at` leaves the avatar in place.
+
 The read-only `query` tool accepts one or more entries in `queries`. Each entry uses the `query` field to specify an operation. The corresponding receipt uses the entry's zero-based `index`.
 
 | Operation | Parameters and behavior |
 | --- | --- |
-| `collect_at` (action) | Takes integer `x` and `y` and the same `target` and `item` fields as `collect`. Walks to the nearest reachable neighboring tile and collects once. |
-| `place_at` (action) | Takes integer `x` and `y` and a `structure`. Walks to the nearest reachable neighboring tile and places once. |
+| `collect_at` (action) | Takes integer `x` and `y` and the same `target`, `item`, and `count` fields as `collect`. Walks to the nearest reachable neighboring tile and collects the requested quantity. |
+| `place_at` (action) | Takes integer `x` and `y`, a `structure`, and optional `stand: [x,y]`. Walks to the specified adjacent tile or, with `stand` omitted, the nearest reachable neighboring tile. An unreachable specified stand fails the action. |
 | `find_resources` (query) | Takes `resource` such as `tree`, `bush`, or an item name. Ranks candidates by walking distance to a collection tile. The count for a tree is how many logs it drops. |
 | `estimate_materials` (query) | Takes `counts`, a map of structure names to quantities such as `{"wall_ns":7,"floor":1,"grass_bed":1}`. Returns required items, craft counts, and raw materials still needed after inventory. |
-| `preview_build` (query) | Takes ordered `placements` with `x`, `y`, `structure`, and optional `stand: [x,y]`. It simulates placement with virtual materials and walks to the specified adjacent tile or the nearest reachable stand. The receipt includes the material estimate and the first failed placement. For a placement the avatar could reach at the start, `failure.lostAccessAfter.index` identifies the earlier placement that cut access. On success, `wallSeams` lists adjacent walls where only one arm points across their shared edge. |
+| `preview_build` (query) | Takes ordered `placements` with `x`, `y`, `structure`, and optional `stand: [x,y]`. It simulates placement with virtual materials and uses the same stand rules as `place_at`. The receipt includes the material estimate and the first failed placement. When an earlier placement cut access to an initially reachable target or stand, `failure.lostAccessAfter` gives the earlier placement's zero-based `index` and `[x,y]` `position`. On success, `wallSeams` lists adjacent walls where only one arm points across their shared edge. |
 | `find_build_sites` (query) | Takes integer `width` and `height`. Reports rectangular sites away from water and existing structures, along with entrances, walking distance, and tiles to clear. With `nonOverlapping: true`, returns a largest group up to `limit` with no shared tiles. Site rank breaks ties. |
 
 Resource and site queries accept `limit` from 1 to 10, with a default of 3. You can inspect all calls and receipts in Developer Tools.

@@ -9,8 +9,8 @@ enum CharacterActionName: String, CaseIterable {
 enum CharacterAction: Decodable, Sendable {
     case world(WorldAction)
     case walkTo(Position)
-    case collectAt(Position, CollectTarget)
-    case placeAt(Position, Structure)
+    case collectAt(Position, CollectTarget, count: Int = 1)
+    case placeAt(Position, Structure, stand: Position? = nil)
     case say(String)
     case invalid
 
@@ -33,6 +33,12 @@ enum CharacterAction: Decodable, Sendable {
         }
 
         let count = fields.allKeys.count
+        let hasQuantity = fields.contains(ToolField("count"))
+        func quantity() -> Int? {
+            guard hasQuantity else { return 1 }
+            guard let amount = value(Int.self, "count"), amount > 0 else { return nil }
+            return amount
+        }
         let direction = string("direction").flatMap(Direction.init(rawValue:))
         switch name {
         case .move:
@@ -54,34 +60,44 @@ enum CharacterAction: Decodable, Sendable {
             }
             let baseCount = name == .collect ? 3 : 4
             let target: CollectTarget
+            let amount: Int
             switch kind {
             case .item:
-                guard count == baseCount + 1, let item = string("item").flatMap(Item.init(rawValue:)) else {
+                guard count == baseCount + (hasQuantity ? 2 : 1), let itemCount = quantity(),
+                      let item = string("item").flatMap(Item.init(rawValue:)) else {
                     self = .invalid
                     return
                 }
                 target = .item(item)
+                amount = itemCount
             case .above, .ground:
                 guard count == baseCount else {
                     self = .invalid
                     return
                 }
                 target = kind == .above ? .above : .ground
+                amount = 1
             }
             if name == .collect, let direction {
-                self = .world(.collect(direction, target))
+                self = .world(.collect(direction, target, count: amount))
             } else if name == .collectAt, let destination = position() {
-                self = .collectAt(destination, target)
+                self = .collectAt(destination, target, count: amount)
             } else {
                 self = .invalid
             }
         case .placeAt:
-            guard count == 4, let destination = position(),
+            let standKey = ToolField("stand")
+            guard count == (fields.contains(standKey) ? 5 : 4), let destination = position(),
                   let structure = value(Structure.self, "structure") else {
                 self = .invalid
                 return
             }
-            self = .placeAt(destination, structure)
+            do {
+                let stand = try fields.decodeStand(forKey: standKey)
+                self = .placeAt(destination, structure, stand: stand)
+            } catch {
+                self = .invalid
+            }
         case .drop:
             guard count == 3, let direction,
                   let item = string("item").flatMap(Item.init(rawValue:)) else {
@@ -90,11 +106,12 @@ enum CharacterAction: Decodable, Sendable {
             }
             self = .world(.drop(direction, item))
         case .craft:
-            guard count == 2, let recipe = string("item").flatMap(Recipe.init(rawValue:)) else {
+            guard count == (hasQuantity ? 3 : 2), let amount = quantity(),
+                  let recipe = string("item").flatMap(Recipe.init(rawValue:)) else {
                 self = .invalid
                 return
             }
-            self = .world(.craft(recipe))
+            self = .world(.craft(recipe, count: amount))
         case .place:
             guard count == 3, let direction,
                   let structure = string("structure").flatMap(Structure.init(rawValue:)) else {
@@ -123,6 +140,18 @@ struct ToolField: CodingKey {
     init(_ name: String) { stringValue = name }
     init?(stringValue: String) { self.init(stringValue) }
     init?(intValue: Int) { return nil }
+}
+
+extension KeyedDecodingContainer {
+    func decodeStand(forKey key: Key) throws -> Position? {
+        guard contains(key) else { return nil }
+        let coordinates = try decode([Int].self, forKey: key)
+        guard coordinates.count == 2 else {
+            throw DecodingError.dataCorruptedError(forKey: key, in: self,
+                                                   debugDescription: "Expected stand coordinates [x, y]")
+        }
+        return Position(x: coordinates[0], y: coordinates[1])
+    }
 }
 
 struct ActionBatch: Decodable, Sendable {

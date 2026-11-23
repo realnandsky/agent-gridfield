@@ -39,28 +39,32 @@ struct HistoryEvent: Encodable, Sendable {
     var count: Int? = nil
     var avatar: [Int]? = nil
     var query: ToolReceipt.Query? = nil
+    var placementCount: Int? = nil
+    var bounds: [[Int]]? = nil
 
     init?(action: CharacterAction, result: ActionOutcome, from avatar: Position) {
         let description: String
         switch action {
-        case .world(.craft(let recipe)):
+        case .world(.craft(let recipe, let count)):
             let ingredients = recipe.ingredients.namedCounts.sorted { $0.key < $1.key }
                 .map { "\($0.value) \($0.key)" }.joined(separator: " + ")
-            description = "craft \(ingredients) -> \(recipe.output.count) \(recipe.output.item.rawValue)"
+            let recipeDescription = "\(ingredients) -> \(recipe.output.count) \(recipe.output.item.rawValue)"
+            description = count == 1 ? "craft \(recipeDescription)" : "craft \(count) batches (\(recipeDescription))"
         case .world(.move(let direction)):
             description = "move \(direction.rawValue)"
-        case .world(.collect(let direction, let target)):
-            description = Self.collectDescription(at: avatar.neighbor(direction), target: target)
+        case .world(.collect(let direction, let target, let count)):
+            description = Self.collectDescription(at: avatar.neighbor(direction), target: target, count: count)
         case .world(.place(let direction, let structure)):
             description = "place \(structure.rawValue) at \(Self.label(avatar.neighbor(direction)))"
         case .world(.drop(let direction, let item)):
             description = "drop \(item.rawValue) at \(Self.label(avatar.neighbor(direction)))"
         case .walkTo(let position):
             description = "walk_to \(Self.label(position))"
-        case .collectAt(let position, let target):
-            description = Self.collectDescription(at: position, target: target)
-        case .placeAt(let position, let structure):
-            description = "place \(structure.rawValue) at \(Self.label(position))"
+        case .collectAt(let position, let target, let count):
+            description = Self.collectDescription(at: position, target: target, count: count)
+        case .placeAt(let position, let structure, let stand):
+            let standDescription = stand.map { " from \(Self.label($0))" } ?? ""
+            description = "place \(structure.rawValue) at \(Self.label(position))\(standDescription)"
         case .invalid:
             description = "invalid action"
         case .say, .world(.finish):
@@ -84,6 +88,18 @@ struct HistoryEvent: Encodable, Sendable {
             description = "invalid query"
         }
         self.init(action: description, result: result == nil ? .invalidArguments : .inspected, from: avatar)
+        if case .previewBuild(let placements) = query, let first = placements.first {
+            placementCount = placements.count
+            var minX = first.x, maxX = first.x
+            var minY = first.y, maxY = first.y
+            for placement in placements.dropFirst() {
+                minX = min(minX, placement.x)
+                maxX = max(maxX, placement.x)
+                minY = min(minY, placement.y)
+                maxY = max(maxY, placement.y)
+            }
+            bounds = [[minX, minY], [maxX, maxY]]
+        }
         if var result {
             result.resources = result.resources.map { Array($0.prefix(3)) }
             result.sites = result.sites.map { Array($0.prefix(3)) }
@@ -104,14 +120,15 @@ struct HistoryEvent: Encodable, Sendable {
 
     private static func label(_ position: Position) -> String { "[\(position.x),\(position.y)]" }
 
-    private static func collectDescription(at position: Position, target: CollectTarget) -> String {
+    private static func collectDescription(at position: Position, target: CollectTarget, count: Int) -> String {
         let what: String
         switch target {
         case .above: what = "above"
         case .ground: what = "ground"
         case .item(let item): what = item.rawValue
         }
-        return "collect \(what) at \(label(position))"
+        let quantity = count == 1 ? "" : "\(count) "
+        return "collect \(quantity)\(what) at \(label(position))"
     }
 }
 

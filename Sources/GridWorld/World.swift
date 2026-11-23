@@ -112,9 +112,9 @@ enum CollectTarget: Sendable {
 
 enum WorldAction: Sendable {
     case move(Direction)
-    case collect(Direction, CollectTarget)
+    case collect(Direction, CollectTarget, count: Int = 1)
     case drop(Direction, Item)
-    case craft(Recipe)
+    case craft(Recipe, count: Int = 1)
     case place(Direction, Structure)
     case finish
 }
@@ -385,16 +385,16 @@ struct World: Equatable, Sendable {
             let outcome = movementOutcome(to: target)
             if outcome == .moved { avatar = target }
             return outcome
-        case .collect(let direction, let selection):
+        case .collect(let direction, let selection, let count):
             guard let target = index(of: avatar.neighbor(direction)) else { return .boundary }
-            return collect(selection, at: target)
+            return collect(selection, at: target, count: count)
         case .drop(let direction, let item):
             guard let target = index(of: avatar.neighbor(direction)) else { return .boundary }
-            guard inventory.removeOne(item) else { return .itemNotCarried }
+            guard inventory.remove(item) else { return .itemNotCarried }
             tiles[target].items[item, default: 0] += 1
             return .dropped
-        case .craft(let recipe):
-            return craft(recipe)
+        case .craft(let recipe, let count):
+            return craft(recipe, count: count)
         case .place(let direction, let structure):
             guard let target = index(of: avatar.neighbor(direction)) else { return .boundary }
             return place(structure, at: target)
@@ -417,17 +417,19 @@ struct World: Equatable, Sendable {
         return position.y * width + position.x
     }
 
-    private mutating func craft(_ recipe: Recipe) -> ActionOutcome {
+    private mutating func craft(_ recipe: Recipe, count: Int) -> ActionOutcome {
+        guard count > 0 else { return .invalidArguments }
         let ingredients = recipe.ingredients
-        guard ingredients.allSatisfy({ inventory[$0.key, default: 0] >= $0.value }) else {
+        guard ingredients.allSatisfy({ inventory[$0.key, default: 0] / $0.value >= count }) else {
             return .missingIngredients
         }
-        for (item, count) in ingredients {
-            let remaining = inventory[item, default: 0] - count
-            inventory[item] = remaining == 0 ? nil : remaining
-        }
         let output = recipe.output
-        inventory[output.item, default: 0] += output.count
+        let currentOutput = inventory[output.item, default: 0]
+        guard count <= (Int.max - currentOutput) / output.count else { return .invalidArguments }
+        for (item, units) in ingredients {
+            _ = inventory.remove(item, count: units * count)
+        }
+        inventory[output.item] = currentOutput + output.count * count
         return .crafted
     }
 
@@ -442,7 +444,7 @@ struct World: Equatable, Sendable {
         default:
             guard tile.fixture == nil, !tile.hasFloor else { return .occupied }
         }
-        guard inventory.removeOne(structure.item) else { return .itemNotCarried }
+        guard inventory.remove(structure.item) else { return .itemNotCarried }
         if structure == .floor {
             tiles[index].hasFloor = true
         } else {
@@ -451,19 +453,26 @@ struct World: Equatable, Sendable {
         return .placed
     }
 
-    private mutating func collect(_ selection: CollectTarget, at index: Int) -> ActionOutcome {
+    private mutating func collect(_ selection: CollectTarget, at index: Int, count: Int) -> ActionOutcome {
+        guard count > 0 else { return .invalidArguments }
         switch selection {
         case .item(let item):
-            let collected = tiles[index].items.removeOne(item)
-                || (item == .branch && tiles[index].resources.removeOne(item))
-            guard collected else { return .itemAbsent }
-            inventory[item, default: 0] += 1
+            let loose = min(count, tiles[index].items[item, default: 0])
+            let attached = count - loose
+            let availableAttached = item == .branch ? tiles[index].resources[item, default: 0] : 0
+            guard attached <= availableAttached else { return .itemAbsent }
+            let (total, overflow) = inventory[item, default: 0].addingReportingOverflow(count)
+            guard !overflow else { return .invalidArguments }
+            _ = tiles[index].items.remove(item, count: loose)
+            _ = tiles[index].resources.remove(item, count: attached)
+            inventory[item] = total
         case .above:
+            guard count == 1 else { return .invalidArguments }
             if tiles[index].terrain == .tree {
                 var items = tiles[index].items
                 items[.log, default: 0] += Self.logsPerTree
                 tiles[index] = Tile(terrain: .grass, items: items)
-            } else if tiles[index].resources.removeOne(.grass) {
+            } else if tiles[index].resources.remove(.grass) {
                 inventory[.grass, default: 0] += 1
             } else if let fixture = tiles[index].fixture {
                 tiles[index].fixture = nil
@@ -472,6 +481,7 @@ struct World: Equatable, Sendable {
                 return .blockUnavailable
             }
         case .ground:
+            guard count == 1 else { return .invalidArguments }
             guard tiles[index].hasFloor else { return .blockUnavailable }
             tiles[index].hasFloor = false
             inventory[.plank, default: 0] += 1
@@ -485,9 +495,9 @@ extension Dictionary where Key == Item, Value == Int {
         Dictionary<String, Int>(uniqueKeysWithValues: map { ($0.key.rawValue, $0.value) })
     }
 
-    fileprivate mutating func removeOne(_ item: Item) -> Bool {
-        guard let count = self[item], count > 0 else { return false }
-        self[item] = count == 1 ? nil : count - 1
+    fileprivate mutating func remove(_ item: Item, count: Int = 1) -> Bool {
+        guard count > 0, let available = self[item], available >= count else { return false }
+        self[item] = available == count ? nil : available - count
         return true
     }
 }

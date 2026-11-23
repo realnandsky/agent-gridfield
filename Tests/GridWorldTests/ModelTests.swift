@@ -431,6 +431,108 @@ func coordinateActionsAndQueriesSeeTheCurrentWorld() async throws {
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
+func placeAtUsesThePreviewStandAndHistoryIdentifiesTheBlueprints() async throws {
+    let game = GameSession(actionDelay: .zero)
+    let model = ScriptedTools([
+        toolCall("previews", .query, """
+        {"queries":[
+          {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"wall_ew"},
+                                                 {"x":9,"y":6,"structure":"floor","stand":[9,5]}]},
+          {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor","stand":[10,5]}]}
+        ]}
+        """),
+        batchCall("prepare", """
+        [{"action":"collect","direction":"north","target":"above"},
+         {"action":"collect","direction":"north","target":"item","item":"log"},
+         {"action":"craft","item":"plank"},
+         {"action":"place_at","x":8,"y":5,"structure":"floor","stand":[7,5]},
+         {"action":"say","text":"Skipped"}]
+        """),
+        batchCall("build", #"[{"action":"place_at","x":9,"y":5,"structure":"floor","stand":[10,5]}]"#),
+        batchCall("finish", #"[{"action":"finish"}]"#),
+    ])
+    game.start(model: model)
+    await (try #require(game.task)).value
+
+    let replies = await model.replies.map(\.receipt)
+    try #require(replies.count == 3)
+    let previews = try #require(replies[0].queries)
+    try #require(previews.count == 2)
+    let failure = try #require(previews[0].preview?.failure)
+    #expect(failure.position == [9, 6])
+    #expect(failure.lostAccessAfter?.index == 0)
+    #expect(failure.lostAccessAfter?.position == [9, 5])
+    #expect(previews[1].preview?.validLayout == true)
+    let previewHistory = try #require(replies[1].recentHistory?.last)
+    #expect(previewHistory.map(\.placementCount) == [2, 1])
+    #expect(previewHistory.map(\.bounds) == [[[9, 5], [9, 6]], [[9, 5], [9, 5]]])
+    #expect(previewHistory.first?.query?.preview?.failure?.lostAccessAfter?.position == [9, 5])
+
+    #expect(replies[1].results == [.collected, .collected, .crafted, .unreachable])
+    #expect(replies[1].skipped == 1)
+    #expect(replies[1].observation.avatar == Position(x: 8, y: 5))
+    #expect(replies[1].observation.inventory == ["plank": 4])
+    #expect(replies[2].results == [.placed])
+    #expect(game.world.avatar == Position(x: 10, y: 5))
+    #expect(game.world.tile(at: Position(x: 9, y: 5))?.hasFloor == true)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
+func bulkCollectAndCraftUseOneResultPerAction() async throws {
+    let game = GameSession(actionDelay: .zero)
+    let model = ScriptedTools([
+        batchCall("gather", """
+        [{"action":"collect","direction":"north","target":"above"},
+         {"action":"collect","direction":"north","target":"item","item":"log","count":2},
+         {"action":"collect_at","x":11,"y":5,"target":"above"},
+         {"action":"walk_to","x":8,"y":5}]
+        """),
+        batchCall("too-many", """
+        [{"action":"collect_at","x":11,"y":5,"target":"item","item":"log","count":3},
+         {"action":"craft","item":"plank","count":2}]
+        """),
+        batchCall("craft", """
+        [{"action":"collect_at","x":11,"y":5,"target":"item","item":"log","count":2},
+         {"action":"craft","item":"plank","count":4}]
+        """),
+        batchCall("finish", #"[{"action":"finish"}]"#),
+    ])
+    game.start(model: model)
+    await (try #require(game.task)).value
+
+    let replies = await model.replies.map(\.receipt)
+    try #require(replies.count == 3)
+    #expect(replies[0].results == [.collected, .collected, .collected, .arrived])
+    #expect(replies[0].observation.inventory == ["log": 2])
+    #expect(replies[1].results == [.itemAbsent])
+    #expect(replies[1].skipped == 1)
+    #expect(replies[1].observation == replies[0].observation)
+    #expect(replies[2].results == [.collected, .crafted])
+    #expect(replies[2].skipped == 0)
+    #expect(game.world.avatar == Position(x: 10, y: 5))
+    #expect(game.world.inventory == [.plank: 16])
+}
+
+@Test(arguments: [
+    #"{"action":"place_at","x":9,"y":5,"structure":"floor","stand":[10,5,0]}"#,
+    #"{"action":"place_at","x":9,"y":5,"structure":"floor","stand":[10,"5"]}"#,
+    #"{"action":"place_at","x":9,"y":5,"structure":"floor","stand":null}"#,
+    #"{"action":"craft","item":"plank","count":0}"#,
+    #"{"action":"craft","item":"plank","count":1.5}"#,
+    #"{"action":"collect","direction":"north","target":"item","item":"log","count":-1}"#,
+    #"{"action":"collect_at","x":8,"y":4,"target":"above","count":2}"#,
+])
+func actionArgumentsRejectInvalidStandOrCount(_ action: String) throws {
+    let batch = try batchCall("invalid", "[\(action)]").decodeBatch()
+    guard case .invalid = try #require(batch.actions.first) else {
+        Issue.record("Expected invalid arguments for \(action)")
+        return
+    }
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
 func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [StubChatEndpoint.self]
@@ -622,6 +724,9 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(properties["target"]?.choices == ["item", "above", "ground"])
     #expect(properties["x"]?.type == "integer")
     #expect(properties["y"]?.type == "integer")
+    #expect(properties["stand"]?.type == "array")
+    #expect(properties["stand"]?.items?.type == "integer")
+    #expect(properties["count"]?.type == "integer")
     #expect(schemas[0].properties?.keys.sorted() == ["actions"])
     #expect(schemas[1].properties?.keys.sorted() == ["remove", "set", "text"])
     let queryProperties = try #require(schemas[2].properties?["queries"]?.items?.properties)

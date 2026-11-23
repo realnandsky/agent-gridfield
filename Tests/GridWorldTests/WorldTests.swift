@@ -157,6 +157,51 @@ import Testing
     #expect(world == empty)
 }
 
+@Test func bulkCollectTakesLooseItemsBeforeAttachedBranches() {
+    var world = World(bushCount: 0)
+    let tree = world.avatar.neighbor(.north)
+    #expect(world.apply(.collect(.east, .item(.branch))) == .collected)
+    #expect(world.apply(.collect(.north, .item(.branch))) == .collected)
+    #expect(world.apply(.drop(.north, .branch)) == .dropped)
+    #expect(world.apply(.drop(.north, .branch)) == .dropped)
+    let before = world
+
+    #expect(world.apply(.collect(.north, .item(.branch), count: 4)) == .itemAbsent)
+    #expect(world.apply(.collect(.north, .item(.branch), count: .max)) == .itemAbsent)
+    #expect(world.apply(.collect(.north, .item(.branch), count: 0)) == .invalidArguments)
+    #expect(world.apply(.collect(.north, .above, count: 2)) == .invalidArguments)
+    #expect(world.apply(.collect(.north, .ground, count: 2)) == .invalidArguments)
+    #expect(world == before)
+
+    #expect(world.apply(.collect(.north, .item(.branch), count: 2)) == .collected)
+    #expect(world.tile(at: tree)?.items.isEmpty == true)
+    #expect(world.tile(at: tree)?.resources == [.branch: 1])
+    #expect(world.apply(.drop(.north, .branch)) == .dropped)
+    #expect(world.apply(.collect(.north, .item(.branch), count: 2)) == .collected)
+    #expect(world.tile(at: tree)?.items.isEmpty == true)
+    #expect(world.tile(at: tree)?.resources.isEmpty == true)
+    #expect(world.inventory == [.branch: 3])
+}
+
+@Test func bulkCraftRequiresEveryIngredientBeforeMakingAnyOutput() {
+    var world = World(bushCount: 0)
+    #expect(world.apply(.collect(.north, .above)) == .collected)
+    #expect(world.apply(.collect(.north, .item(.log), count: 2)) == .collected)
+    let before = world
+
+    #expect(world.apply(.craft(.plank, count: 3)) == .missingIngredients)
+    #expect(world.apply(.craft(.grassBed, count: .max)) == .missingIngredients)
+    #expect(world.apply(.craft(.plank, count: -1)) == .invalidArguments)
+    #expect(world == before)
+    #expect(world.apply(.craft(.plank, count: 2)) == .crafted)
+    #expect(world.inventory == [.plank: 8])
+
+    var highInventory = world.suppliedForPreview([.log: .max])
+    let beforeOverflow = highInventory
+    #expect(highInventory.apply(.craft(.plank, count: .max)) == .invalidArguments)
+    #expect(highInventory == beforeOverflow)
+}
+
 @Test func compactObservationUsesWorldCoordinatesAndOmitsEmptyLists() throws {
     var world = World()
     #expect(world.apply(.collect(.north, .above)) == .collected)

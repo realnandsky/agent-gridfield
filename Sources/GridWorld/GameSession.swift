@@ -442,13 +442,13 @@ final class GameSession {
                 } else {
                     outcome = projectedWorld.tile(at: destination) == nil ? .boundary : .unreachable
                 }
-            case .collectAt(let position, let target):
-                let interaction = projectedWorld.interact(at: position) { .collect($0, target) }
+            case .collectAt(let position, let target, let count):
+                let interaction = projectedWorld.interact(at: position) { .collect($0, target, count: count) }
                 outcome = interaction.outcome
                 actionSteps = interaction.walked.map(PlaybackStep.walk)
                 if outcome.success { actionSteps.append(.world(projectedWorld)) }
-            case .placeAt(let position, let structure):
-                let interaction = projectedWorld.interact(at: position) { .place($0, structure) }
+            case .placeAt(let position, let structure, let stand):
+                let interaction = projectedWorld.interact(at: position, standingAt: stand) { .place($0, structure) }
                 outcome = interaction.outcome
                 actionSteps = interaction.walked.map(PlaybackStep.walk)
                 if outcome.success { actionSteps.append(.world(projectedWorld)) }

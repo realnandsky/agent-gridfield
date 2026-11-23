@@ -337,17 +337,18 @@ struct ChatCompletionsModel: CharacterModel {
         Entry IDs are nonblank strings. An ID can appear in either set or remove per call. All changes apply together.
         Notebook text is limited to \(MemoryReceipt.notebookByteLimit) UTF-8 bytes; saved IDs and entry text share a separate \(MemoryReceipt.byteLimit)-byte limit.
         memory({}) returns saved entries and the current observation. recentHistory contains up to four earlier batches of processed actions and queries.
+        Historical preview_build events include placementCount and bounds [[minX,minY],[maxX,maxY]] of all proposed placements. History count groups identical adjacent actions.
 
         [Actions]
         act accepts a nonempty ordered actions array.
         action     | fields besides action
         move       | direction
         walk_to    | x, y (integers)
-        collect    | direction, target; item required for target=item, omitted otherwise
-        collect_at | x, y, target; same item rule as collect
-        place_at   | x, y, structure
+        collect    | direction, target (target=item requires item and allows count)
+        collect_at | x, y, target (same item and count rules as collect)
+        place_at   | x, y, structure, optional stand
         drop       | direction, item
-        craft      | item (recipe name)
+        craft      | item (recipe name), optional count
         place      | direction, structure (full type name from legend)
         say        | text
         finish    | none
@@ -356,14 +357,15 @@ struct ChatCompletionsModel: CharacterModel {
         direction target = one cell from the current avatar; out-of-bounds targets fail
         move = step into target; water, trees, walls and corners block movement
         walk_to = follow the shortest four-direction route to the exact [x,y] cell using the same movement rules
-        collect_at and place_at walk to the nearest reachable neighboring cell and perform the action
+        collect_at and place_at walk to the nearest reachable neighboring cell and perform the action. place_at can specify an exact stand, using the same rules as preview_build
         failed coordinate actions leave the avatar in place
         walk_to results: arrived (including zero steps), boundary (outside the map), unreachable (no route)
         drop = transfer 1 item from inventory to target
+        count is a positive integer, defaults to 1, and applies to the entire action. If there are too few items or ingredients, the action fails without transferring or crafting any.
 
         [Collect]
         target | selection    | effect
-        item   | item name    | add 1 to inventory; take loose items before attached items
+        item   | item name    | take loose items before attached items and add count to inventory
         above  | tree         | clear tree and its attached branches; drop \(World.logsPerTree) logs in place
         above  | bush         | clear bush; add 1 grass to inventory
         above  | grass_bed    | clear bed; add 1 grass_bed to inventory
@@ -372,6 +374,7 @@ struct ChatCompletionsModel: CharacterModel {
         collect requires a matching item or collectible block
 
         [Craft]
+        count is the number of times to run the recipe. The table gives ingredient and output quantities per recipe run.
         recipe | consume from inventory -> add to inventory
         \(recipeRules)
 
@@ -398,8 +401,8 @@ struct ChatCompletionsModel: CharacterModel {
         other resources are collectible items; use target=item with item matching the resource
         estimate_materials returns required finished items, recommended craft batches, and missing raw ingredients after inventory
         preview_build checks the given placement order with hypothetical materials; returns materials, validLayout and the first failure {index, position, reason} if any
-        stand is an optional exact [x,y] tile orthogonally adjacent to the placement target; the preview walks there before placing. If omitted it uses the nearest reachable stand
-        for an unreachable placement with a reachable stand at the start, failure.lostAccessAfter.index is the zero-based index of the earlier placement that cut access
+        stand is an optional exact [x,y] tile orthogonally adjacent to the placement target. Placement fails if the specified stand cannot be reached. If omitted, placement uses the nearest reachable stand.
+        for an unreachable placement with a reachable stand at the start, failure.lostAccessAfter contains the zero-based index and [x,y] position of the earlier placement that cut access
         after successful simulation, preview.wallSeams lists one-sided connections between adjacent walls as {from, to, direction}; an empty array means none found
         find_build_sites ranks rectangular footprints by fewest cells to clear then shortest walk to a perimeter entrance
         nonOverlapping: true returns as many footprints as fit without sharing tiles, up to limit, with rank breaking ties
@@ -579,6 +582,10 @@ private struct ToolDefinition: Encodable, Sendable {
         properties: [:]
     )
 
+    private static let stand = Parameter(type: "array", items: .init(type: "integer"),
+                                         description: "Exact [x,y] tile orthogonally adjacent to the target.",
+                                         minItems: 2, maxItems: 2)
+
     private static let action = Parameter(type: "object", properties: [
         "action": .init(values: CharacterActionName.allCases.map(\.rawValue)),
         "direction": .init(values: Direction.allCases.map(\.rawValue)),
@@ -587,6 +594,8 @@ private struct ToolDefinition: Encodable, Sendable {
         "target": .init(values: CollectTarget.Kind.allCases.map(\.rawValue)),
         "item": .init(values: Item.allCases.map(\.rawValue)),
         "structure": .init(values: Structure.allCases.map(\.rawValue)),
+        "stand": stand,
+        "count": .init(type: "integer", description: "Recipe runs for craft or items to collect for target=item. Defaults to 1.", minimum: 1),
         "text": .init(),
     ], required: ["action"], additionalProperties: false)
 
@@ -603,8 +612,7 @@ private struct ToolDefinition: Encodable, Sendable {
             "x": .init(type: "integer"),
             "y": .init(type: "integer"),
             "structure": .init(values: Structure.allCases.map(\.rawValue)),
-            "stand": .init(type: "array", items: .init(type: "integer"),
-                           description: "Exact [x,y] tile orthogonally adjacent to the target.", minItems: 2, maxItems: 2),
+            "stand": stand,
         ], required: ["x", "y", "structure"], additionalProperties: false)),
     ], required: ["query"], additionalProperties: false)
 
@@ -631,10 +639,12 @@ private struct ToolDefinition: Encodable, Sendable {
         let description: String?
         let minItems: Int?
         let maxItems: Int?
+        let minimum: Int?
 
         init(type: String = "string", values: [String]? = nil, properties: [String: Parameter]? = nil,
              items: Parameter? = nil, required: [String]? = nil, additionalProperties: Bool? = nil,
-             description: String? = nil, valueType: Parameter? = nil, minItems: Int? = nil, maxItems: Int? = nil) {
+             description: String? = nil, valueType: Parameter? = nil, minItems: Int? = nil, maxItems: Int? = nil,
+             minimum: Int? = nil) {
             self.type = type
             self.values = values
             self.properties = properties
@@ -645,10 +655,11 @@ private struct ToolDefinition: Encodable, Sendable {
             self.description = description
             self.minItems = minItems
             self.maxItems = maxItems
+            self.minimum = minimum
         }
 
         enum CodingKeys: String, CodingKey {
-            case type, properties, items, required, additionalProperties, description, minItems, maxItems
+            case type, properties, items, required, additionalProperties, description, minItems, maxItems, minimum
             case values = "enum"
         }
     }
