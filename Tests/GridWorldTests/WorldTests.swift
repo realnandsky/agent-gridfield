@@ -296,3 +296,85 @@ func expandMapRow(_ row: String) -> [String] {
     #expect(correct.wallSeams?.isEmpty == true)
     #expect(world.tile(at: Position(x: 8, y: 5))?.fixture == nil)
 }
+
+@Test func blueprintReportsThePlacementThatCutOffAccess() throws {
+    let world = World(bushCount: 0)
+    let initial = world.observation()
+    var placements: [BlueprintPlacement] = [
+        .init(x: 2, y: 8, structure: .cornerSE),
+        .init(x: 3, y: 8, structure: .wallEW),
+        .init(x: 4, y: 8, structure: .cornerSW),
+        .init(x: 2, y: 9, structure: .wallNS),
+        .init(x: 3, y: 9, structure: .floor),
+        .init(x: 4, y: 9, structure: .wallNS),
+        .init(x: 2, y: 10, structure: .cornerNE),
+        .init(x: 3, y: 10, structure: .wallEW),
+        .init(x: 4, y: 10, structure: .cornerNW),
+    ]
+
+    let preview = world.previewBuild(placements)
+    let failure = try #require(preview.failure)
+    #expect(!preview.validLayout)
+    #expect(failure.index == 8)
+    #expect(failure.position == [4, 10])
+    #expect(failure.reason == .unreachable)
+    #expect(failure.lostAccessAfter?.index == 7)
+
+    placements[7] = .init(x: 3, y: 10, structure: .wallEW, stand: Position(x: 3, y: 11))
+    let fromOutside = world.previewBuild(placements)
+    #expect(fromOutside.validLayout)
+    #expect(fromOutside.failure == nil)
+    #expect(world.observation() == initial)
+}
+
+@Test func blueprintOmitsAccessLossForAnInitiallyUnreachableTarget() throws {
+    let world = World(bushCount: 0)
+    let preview = world.previewBuild([
+        .init(x: 9, y: 5, structure: .floor),
+        .init(x: 13, y: 0, structure: .cornerSE),
+    ])
+
+    let failure = try #require(preview.failure)
+    #expect(failure.index == 1)
+    #expect(failure.reason == .unreachable)
+    #expect(failure.lostAccessAfter == nil)
+}
+
+@Test func blueprintTracksAccessLossAcrossLaterPlacements() throws {
+    let world = World(bushCount: 0)
+    let preview = world.previewBuild([
+        .init(x: 8, y: 9, structure: .cornerSE),
+        .init(x: 8, y: 7, structure: .floor),
+        .init(x: 9, y: 9, structure: .wallEW),
+    ])
+
+    let failure = try #require(preview.failure)
+    #expect(failure.index == 2)
+    #expect(failure.reason == .unreachable)
+    #expect(failure.lostAccessAfter?.index == 0)
+}
+
+@Test func blueprintChecksAccessToTheSpecifiedStand() throws {
+    let world = World(bushCount: 0)
+    let wall = BlueprintPlacement(x: 9, y: 5, structure: .wallEW)
+    let floor = BlueprintPlacement(x: 9, y: 6, structure: .floor, stand: Position(x: 9, y: 5))
+    #expect(world.previewBuild([floor]).validLayout)
+    #expect(world.previewBuild([wall, .init(x: 9, y: 6, structure: .floor)]).validLayout)
+
+    let failure = try #require(world.previewBuild([wall, floor]).failure)
+    #expect(failure.index == 1)
+    #expect(failure.reason == .unreachable)
+    #expect(failure.lostAccessAfter?.index == 0)
+}
+
+@Test func blueprintRejectsANonadjacentStand() throws {
+    let world = World(bushCount: 0)
+    let preview = world.previewBuild([
+        .init(x: 9, y: 5, structure: .wallEW, stand: Position(x: 8, y: 6)),
+    ])
+
+    let failure = try #require(preview.failure)
+    #expect(failure.index == 0)
+    #expect(failure.reason == .invalidArguments)
+    #expect(failure.lostAccessAfter == nil)
+}

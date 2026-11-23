@@ -83,8 +83,8 @@ The read-only `query` tool accepts one or more entries in `queries`. Each entry 
 | `place_at` (action) | Takes integer `x` and `y` and a `structure`. Walks to the nearest reachable neighboring tile and places once. |
 | `find_resources` (query) | Takes `resource` such as `tree`, `bush`, or an item name. Ranks candidates by walking distance to a collection tile. The count for a tree is how many logs it drops. |
 | `estimate_materials` (query) | Takes `counts`, a map of structure names to quantities such as `{"wall_ns":7,"floor":1,"grass_bed":1}`. Returns required items, craft counts, and raw materials still needed after inventory. |
-| `preview_build` (query) | Takes `placements`, an ordered array of `{x,y,structure}`. Returns the material estimate and the first placement that fails or is unreachable. It simulates placement with virtual materials. On success, `wallSeams` lists adjacent walls where only one arm points across their shared edge. |
-| `find_build_sites` (query) | Takes integer `width` and `height`. Reports rectangular sites away from water and existing structures, along with entrances, walking distance, and tiles to clear. |
+| `preview_build` (query) | Takes ordered `placements` with `x`, `y`, `structure`, and optional `stand: [x,y]`. It simulates placement with virtual materials and walks to the specified adjacent tile or the nearest reachable stand. The receipt includes the material estimate and the first failed placement. For a placement the avatar could reach at the start, `failure.lostAccessAfter.index` identifies the earlier placement that cut access. On success, `wallSeams` lists adjacent walls where only one arm points across their shared edge. |
+| `find_build_sites` (query) | Takes integer `width` and `height`. Reports rectangular sites away from water and existing structures, along with entrances, walking distance, and tiles to clear. With `nonOverlapping: true`, returns a largest group up to `limit` with no shared tiles. Site rank breaks ties. |
 
 Resource and site queries accept `limit` from 1 to 10, with a default of 3. You can inspect all calls and receipts in Developer Tools.
 

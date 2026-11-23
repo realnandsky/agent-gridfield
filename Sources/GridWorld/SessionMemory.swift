@@ -78,8 +78,8 @@ struct HistoryEvent: Encodable, Sendable {
             description = "estimate_materials"
         case .previewBuild:
             description = "preview_build"
-        case .findBuildSites(let width, let height, _):
-            description = "find_build_sites \(width)x\(height)"
+        case .findBuildSites(let width, let height, _, let nonOverlapping):
+            description = "find_build_sites \(width)x\(height)" + (nonOverlapping ? " nonOverlapping" : "")
         case .invalid:
             description = "invalid query"
         }

@@ -25,7 +25,7 @@ enum WorldQuery: Decodable {
     case findResources(ResourceKind, limit: Int)
     case estimateMaterials([Structure: Int])
     case previewBuild([BlueprintPlacement])
-    case findBuildSites(width: Int, height: Int, limit: Int)
+    case findBuildSites(width: Int, height: Int, limit: Int, nonOverlapping: Bool)
     case invalid
 
     init(from decoder: any Decoder) throws {
@@ -71,12 +71,15 @@ enum WorldQuery: Decodable {
             }
             self = .previewBuild(placements)
         case .findBuildSites:
-            guard count == (hasLimit ? 4 : 3), let width = value(Int.self, "width"), width > 0,
-                  let height = value(Int.self, "height"), height > 0, let limit else {
+            let hasNonOverlapping = fields.contains(ToolField("nonOverlapping"))
+            let nonOverlapping = hasNonOverlapping ? value(Bool.self, "nonOverlapping") : false
+            guard count == 3 + (hasLimit ? 1 : 0) + (hasNonOverlapping ? 1 : 0),
+                  let width = value(Int.self, "width"), width > 0,
+                  let height = value(Int.self, "height"), height > 0, let limit, let nonOverlapping else {
                 self = .invalid
                 return
             }
-            self = .findBuildSites(width: width, height: height, limit: limit)
+            self = .findBuildSites(width: width, height: height, limit: limit, nonOverlapping: nonOverlapping)
         }
     }
 
@@ -88,8 +91,9 @@ enum WorldQuery: Decodable {
             .init(index: index, materials: world.estimateMaterials(counts))
         case .previewBuild(let placements):
             .init(index: index, preview: world.previewBuild(placements))
-        case .findBuildSites(let width, let height, let limit):
-            .init(index: index, sites: world.findBuildSites(width: width, height: height, limit: limit))
+        case .findBuildSites(let width, let height, let limit, let nonOverlapping):
+            .init(index: index, sites: world.findBuildSites(width: width, height: height, limit: limit,
+                                                           nonOverlapping: nonOverlapping))
         case .invalid:
             nil
         }
@@ -100,8 +104,35 @@ struct BlueprintPlacement: Decodable, Sendable {
     let x: Int
     let y: Int
     let structure: Structure
+    let stand: Position?
 
     var position: Position { Position(x: x, y: y) }
+
+    init(x: Int, y: Int, structure: Structure, stand: Position? = nil) {
+        self.x = x
+        self.y = y
+        self.structure = structure
+        self.stand = stand
+    }
+
+    init(from decoder: any Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        x = try fields.decode(Int.self, forKey: .x)
+        y = try fields.decode(Int.self, forKey: .y)
+        structure = try fields.decode(Structure.self, forKey: .structure)
+        if fields.contains(.stand) {
+            let coordinates = try fields.decode([Int].self, forKey: .stand)
+            guard coordinates.count == 2 else {
+                throw DecodingError.dataCorruptedError(forKey: .stand, in: fields,
+                                                       debugDescription: "Expected stand coordinates [x, y]")
+            }
+            stand = Position(x: coordinates[0], y: coordinates[1])
+        } else {
+            stand = nil
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case x, y, structure, stand }
 }
 
 struct MaterialEstimate: Encodable, Sendable {
@@ -120,9 +151,14 @@ struct ResourceCandidate: Encodable, Sendable {
 
 struct BlueprintPreview: Encodable, Sendable {
     struct Failure: Encodable, Sendable {
+        struct AccessLoss: Encodable, Sendable {
+            let index: Int
+        }
+
         let index: Int
         let position: [Int]
         let reason: ActionOutcome
+        let lostAccessAfter: AccessLoss?
     }
 
     struct WallSeam: Encodable, Sendable {
@@ -142,6 +178,64 @@ struct BuildSite: Encodable, Sendable {
     let entrance: [Int]
     let stepsToEntrance: Int
     let clear: [[Int]]
+
+    static func selectNonOverlapping(from ranked: [BuildSite], width: Int, height: Int, limit: Int) -> [BuildSite] {
+        guard limit > 1, ranked.count > 1 else { return Array(ranked.prefix(limit)) }
+        let origins = ranked.map { Position(x: $0.origin[0], y: $0.origin[1]) }
+        let columnStrips = (origins.map(\.x).max() ?? 0) / width + 1
+        let rowStrips = (origins.map(\.y).max() ?? 0) / height + 1
+
+        func capacity(of startsByStrip: [UInt], span: Int) -> Int {
+            var count = 0
+            for var starts in startsByStrip {
+                // Take the earliest start and discard starts that would overlap it.
+                while starts != 0 {
+                    let start = starts.trailingZeroBitCount
+                    count += 1
+                    starts &= UInt.max << (start + span)
+                }
+            }
+            return count
+        }
+
+        func upperBound(for candidates: [Int]) -> Int {
+            var startsByColumnStrip = Array(repeating: UInt(0), count: columnStrips)
+            var startsByRowStrip = Array(repeating: UInt(0), count: rowStrips)
+            for index in candidates {
+                let origin = origins[index]
+                startsByColumnStrip[origin.x / width] |= UInt(1) << origin.y
+                startsByRowStrip[origin.y / height] |= UInt(1) << origin.x
+            }
+            // Sites within each strip already overlap on one axis, so they must fit along the other.
+            return min(capacity(of: startsByColumnStrip, span: height), capacity(of: startsByRowStrip, span: width))
+        }
+
+        var selected: [Int] = []
+        var best: [Int] = []
+        func search(_ candidates: [Int]) -> Bool {
+            // Visiting sites in rank order ensures the first group of each size wins ties.
+            if selected.count > best.count { best = selected }
+            if best.count == limit { return true }
+            guard selected.count + candidates.count > best.count,
+                  selected.count + upperBound(for: candidates) > best.count else { return false }
+
+            for (offset, index) in candidates.enumerated() {
+                guard selected.count + candidates.count - offset > best.count else { break }
+                let origin = origins[index]
+                let remaining = candidates.dropFirst(offset + 1).filter {
+                    let other = origins[$0]
+                    return abs(origin.x - other.x) >= width || abs(origin.y - other.y) >= height
+                }
+                selected.append(index)
+                if search(remaining) { return true }
+                selected.removeLast()
+            }
+            return false
+        }
+
+        _ = search(Array(ranked.indices))
+        return best.map { ranked[$0] }
+    }
 }
 
 extension World {
@@ -206,18 +300,47 @@ extension World {
         var counts: [Structure: Int] = [:]
         for placement in placements { counts[placement.structure, default: 0] += 1 }
         let estimate = estimateMaterials(counts)
-        var simulated = suppliedForPreview(Self.requiredItems(counts))
+        let initialWorld = suppliedForPreview(Self.requiredItems(counts))
+        var simulated = initialWorld
         for (index, placement) in placements.enumerated() {
-            let outcome = simulated.interact(at: placement.position) { .place($0, placement.structure) }.outcome
+            let outcome = simulated.previewPlacement(placement)
             if !outcome.success {
+                let accessLoss = outcome == .unreachable
+                    ? initialWorld.accessLoss(for: placement, after: placements.prefix(index))
+                    : nil
                 return BlueprintPreview(materials: estimate, validLayout: false,
-                                        failure: .init(index: index, position: [placement.x, placement.y], reason: outcome),
+                                        failure: .init(index: index, position: [placement.x, placement.y],
+                                                       reason: outcome, lostAccessAfter: accessLoss),
                                         wallSeams: nil)
             }
         }
         let newWalls = Set(placements.filter { $0.structure.blocksMovement }.map(\.position))
         return BlueprintPreview(materials: estimate, validLayout: true, failure: nil,
                                 wallSeams: simulated.wallSeams(touching: newWalls))
+    }
+
+    private mutating func previewPlacement(_ placement: BlueprintPlacement) -> ActionOutcome {
+        interact(at: placement.position, standingAt: placement.stand) { .place($0, placement.structure) }.outcome
+    }
+
+    private func accessLoss(for target: BlueprintPlacement, after placements: ArraySlice<BlueprintPlacement>)
+        -> BlueprintPreview.Failure.AccessLoss? {
+        func canApproach(in world: World) -> Bool {
+            let reachable = world.reachability()
+            if let stand = target.stand { return reachable.distance(to: stand) != nil }
+            return reachable.closestStand(to: target.position) != nil
+        }
+
+        guard !placements.isEmpty, canApproach(in: self) else { return nil }
+        var replay = self
+        for (index, placement) in placements.enumerated() {
+            // The prefix already succeeded. Only a blocking structure can shrink its reachable area.
+            _ = replay.previewPlacement(placement)
+            if placement.structure.blocksMovement, !canApproach(in: replay) {
+                return .init(index: index)
+            }
+        }
+        return nil
     }
 
     private func wallSeams(touching newWalls: Set<Position>) -> [BlueprintPreview.WallSeam] {
@@ -243,7 +366,7 @@ extension World {
         return required
     }
 
-    func findBuildSites(width columns: Int, height rows: Int, limit: Int) -> [BuildSite] {
+    func findBuildSites(width columns: Int, height rows: Int, limit: Int, nonOverlapping: Bool = false) -> [BuildSite] {
         guard columns <= width, rows <= height else { return [] }
         let reachable = reachability()
         var sites: [BuildSite] = []
@@ -277,9 +400,14 @@ extension World {
                                    stepsToEntrance: entrance.steps, clear: clear))
             }
         }
-        return Array(sites.sorted {
+        sites.sort {
             ($0.clear.count, $0.stepsToEntrance, $0.origin[1], $0.origin[0])
                 < ($1.clear.count, $1.stepsToEntrance, $1.origin[1], $1.origin[0])
-        }.prefix(limit))
+        }
+        if nonOverlapping {
+            let maxCount = min(limit, (width / columns) * (height / rows), sites.count)
+            return BuildSite.selectNonOverlapping(from: sites, width: columns, height: rows, limit: maxCount)
+        }
+        return Array(sites.prefix(limit))
     }
 }

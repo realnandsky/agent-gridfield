@@ -390,16 +390,19 @@ struct ChatCompletionsModel: CharacterModel {
         query              | fields besides query
         find_resources     | resource, optional limit
         estimate_materials | counts (object: structure name -> quantity)
-        preview_build     | placements (ordered array of {x,y,structure})
-        find_build_sites  | width, height, optional limit
+        preview_build     | placements (ordered array of {x,y,structure,stand?})
+        find_build_sites  | width, height, optional limit and nonOverlapping
         query limit defaults to 3, range 1–10; coordinates and sizes are integers
         find_resources returns reachable candidates {position, stand, steps, count, target}, nearest first
         resource tree or bush uses target=above; tree count is logs dropped by felling; pick up logs separately
         other resources are collectible items; use target=item with item matching the resource
         estimate_materials returns required finished items, recommended craft batches, and missing raw ingredients after inventory
         preview_build checks the given placement order with hypothetical materials; returns materials, validLayout and the first failure {index, position, reason} if any
+        stand is an optional exact [x,y] tile orthogonally adjacent to the placement target; the preview walks there before placing. If omitted it uses the nearest reachable stand
+        for an unreachable placement with a reachable stand at the start, failure.lostAccessAfter.index is the zero-based index of the earlier placement that cut access
         after successful simulation, preview.wallSeams lists one-sided connections between adjacent walls as {from, to, direction}; an empty array means none found
         find_build_sites ranks rectangular footprints by fewest cells to clear then shortest walk to a perimeter entrance
+        nonOverlapping: true returns as many footprints as fit without sharing tiles, up to limit, with rank breaking ties
         each site has origin (top-left), entrance, stepsToEntrance (assuming entrance cleared), and clear (tree or bush coordinates)
 
         [Turn]
@@ -593,12 +596,15 @@ private struct ToolDefinition: Encodable, Sendable {
         "limit": .init(type: "integer"),
         "width": .init(type: "integer"),
         "height": .init(type: "integer"),
+        "nonOverlapping": .init(type: "boolean", description: "Select build sites that share no tiles."),
         "counts": .init(type: "object", properties: Dictionary(uniqueKeysWithValues:
             Structure.allCases.map { ($0.rawValue, Parameter(type: "integer")) }), additionalProperties: false),
         "placements": .init(type: "array", items: .init(type: "object", properties: [
             "x": .init(type: "integer"),
             "y": .init(type: "integer"),
             "structure": .init(values: Structure.allCases.map(\.rawValue)),
+            "stand": .init(type: "array", items: .init(type: "integer"),
+                           description: "Exact [x,y] tile orthogonally adjacent to the target.", minItems: 2, maxItems: 2),
         ], required: ["x", "y", "structure"], additionalProperties: false)),
     ], required: ["query"], additionalProperties: false)
 
@@ -624,10 +630,11 @@ private struct ToolDefinition: Encodable, Sendable {
         let additionalProperties: AdditionalProperties?
         let description: String?
         let minItems: Int?
+        let maxItems: Int?
 
         init(type: String = "string", values: [String]? = nil, properties: [String: Parameter]? = nil,
              items: Parameter? = nil, required: [String]? = nil, additionalProperties: Bool? = nil,
-             description: String? = nil, valueType: Parameter? = nil, minItems: Int? = nil) {
+             description: String? = nil, valueType: Parameter? = nil, minItems: Int? = nil, maxItems: Int? = nil) {
             self.type = type
             self.values = values
             self.properties = properties
@@ -637,10 +644,11 @@ private struct ToolDefinition: Encodable, Sendable {
                 ?? additionalProperties.map(AdditionalProperties.allowed)
             self.description = description
             self.minItems = minItems
+            self.maxItems = maxItems
         }
 
         enum CodingKeys: String, CodingKey {
-            case type, properties, items, required, additionalProperties, description, minItems
+            case type, properties, items, required, additionalProperties, description, minItems, maxItems
             case values = "enum"
         }
     }

@@ -356,7 +356,9 @@ func coordinateActionsAndQueriesSeeTheCurrentWorld() async throws {
         toolCall("plans", .query, """
         {"queries":[{"query":"estimate_materials","counts":{"wall_ns":7,"floor":1,"grass_bed":1}},
          {"query":"find_build_sites","width":3,"height":3,"limit":2},
-         {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor"},{"x":7,"y":5,"structure":"wall_ns"}]}]}
+         {"query":"find_build_sites","width":3,"height":3,"limit":3,"nonOverlapping":true},
+         {"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor","stand":[10,5]},
+                                                {"x":7,"y":5,"structure":"wall_ns"}]}]}
         """),
         batchCall("build", """
         [
@@ -377,19 +379,26 @@ func coordinateActionsAndQueriesSeeTheCurrentWorld() async throws {
     await (try #require(game.task)).value
     let replies = await model.replies
     try #require(replies.count == 4)
-    #expect(replies[0].receipt.results == [.inspected, .inspected, .inspected])
+    #expect(replies[0].receipt.results == [.inspected, .inspected, .inspected, .inspected])
     #expect(replies[1].receipt.results == [.collected, .collected, .crafted, .placed, .collected])
     #expect(replies[2].receipt.results == [.inspected])
     #expect(replies[3].receipt.results == [.buildBlocked])
     #expect(replies[3].receipt.skipped == 1)
     let queries = try #require(replies[0].receipt.queries)
-    try #require(queries.map(\.index) == [0, 1, 2])
+    try #require(queries.map(\.index) == [0, 1, 2, 3])
     #expect(queries[0].materials?.missing == ["log": 3, "grass": 2])
     #expect(queries[0].materials?.crafts == ["plank": 3, "grass_bed": 1])
     #expect(queries[1].sites?.count == 2)
-    #expect(queries[2].preview?.validLayout == false)
-    #expect(queries[2].preview?.failure?.index == 1)
-    #expect(queries[2].preview?.failure?.position == [7, 5])
+    let siteOrigins = try #require(queries[2].sites).map(\.origin)
+    try #require(siteOrigins.count == 3)
+    for (index, origin) in siteOrigins.enumerated() {
+        for other in siteOrigins.dropFirst(index + 1) {
+            #expect(abs(origin[0] - other[0]) >= 3 || abs(origin[1] - other[1]) >= 3)
+        }
+    }
+    #expect(queries[3].preview?.validLayout == false)
+    #expect(queries[3].preview?.failure?.index == 1)
+    #expect(queries[3].preview?.failure?.position == [7, 5])
     let resource = replies[2].receipt.queries?.first?.resources?.first
     #expect(resource?.position == [11, 5])
     #expect(resource?.stand == [10, 5])
@@ -398,6 +407,26 @@ func coordinateActionsAndQueriesSeeTheCurrentWorld() async throws {
     #expect(game.world.tile(at: Position(x: 9, y: 5))?.hasFloor == true)
     #expect(game.world.inventory == [.plank: 3])
     #expect(game.messages.isEmpty)
+}
+
+@Test func nonOverlappingBuildSitesMaximizeCountThenPreferEarlierRanks() {
+    let ranked = [2, 0, 4, 7].map { x in
+        BuildSite(origin: [x, 0], entrance: [x, 0], stepsToEntrance: 0, clear: [])
+    }
+    let moreSites = BuildSite.selectNonOverlapping(from: Array(ranked.prefix(3)), width: 3, height: 1, limit: 2)
+    #expect(moreSites.map(\.origin) == [[0, 0], [4, 0]])
+    let earlierRanks = BuildSite.selectNonOverlapping(from: ranked, width: 3, height: 1, limit: 2)
+    #expect(earlierRanks.map(\.origin) == [[2, 0], [7, 0]])
+}
+
+@Test func previewStandRequiresTwoIntegerCoordinates() throws {
+    let query = try decode(QueryBatch.self, """
+        {"queries":[{"query":"preview_build","placements":[{"x":9,"y":5,"structure":"floor","stand":[8,5,0]}]}]}
+        """)
+    guard case .invalid = try #require(query.queries.first) else {
+        Issue.record("Expected a preview stand with three coordinates to be rejected")
+        return
+    }
 }
 
 @MainActor

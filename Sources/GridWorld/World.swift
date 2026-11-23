@@ -340,12 +340,23 @@ struct World: Equatable, Sendable {
         reachability().route(to: destination)
     }
 
-    mutating func interact(at target: Position, action: (Direction) -> WorldAction)
+    mutating func interact(at target: Position, standingAt requestedStand: Position? = nil,
+                           action: (Direction) -> WorldAction)
         -> (outcome: ActionOutcome, walked: [World]) {
         guard tile(at: target) != nil else { return (.boundary, []) }
         let reachable = reachability()
-        guard let stand = reachable.closestStand(to: target),
-              let route = reachable.route(to: stand.position) else { return (.unreachable, []) }
+        let stand: (position: Position, facing: Direction)
+        if let requestedStand {
+            guard tile(at: requestedStand) != nil,
+                  let side = Direction.allCases.first(where: { target.neighbor($0) == requestedStand }) else {
+                return (.invalidArguments, [])
+            }
+            stand = (requestedStand, side.opposite)
+        } else {
+            guard let nearest = reachable.closestStand(to: target) else { return (.unreachable, []) }
+            stand = (nearest.position, nearest.facing)
+        }
+        guard let route = reachable.route(to: stand.position) else { return (.unreachable, []) }
 
         var projected = self
         var walked: [World] = []
