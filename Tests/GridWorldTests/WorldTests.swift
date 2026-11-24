@@ -327,8 +327,8 @@ func expandMapRow(_ row: String) -> [String] {
 }
 
 @MainActor
-@Test(.timeLimit(.minutes(1))) func interruptedAcquisitionKeepsOnlyPlayedSteps() async throws {
-    let game = GameSession(actionDelay: .milliseconds(250))
+@Test(.timeLimit(.minutes(1))) func interruptedAcquisitionKeepsAppliedSteps() async throws {
+    let game = GameSession(tickInterval: .milliseconds(250))
     let model = AcquireLogsModel()
     let tree = Position(x: 8, y: 4)
     game.start(model: model)
@@ -344,7 +344,7 @@ func expandMapRow(_ row: String) -> [String] {
     #expect(game.world.tile(at: tree)?.terrain == .grass)
     #expect(game.world.tile(at: tree)?.items[.log] == 2)
     #expect(game.world.inventory[.log] == nil)
-    #expect(game.toolActivity.first?.summary == "Interrupted")
+    #expect(game.toolActivity.first?.summary == "Interrupted · 1 skipped")
 
     game.start(model: model)
     await (try #require(game.task)).value

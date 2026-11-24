@@ -131,7 +131,7 @@ enum ActionOutcome: String, Codable, Sendable {
     case itemNotCarried = "item_not_carried", invalidArguments = "invalid_arguments"
     case unknownTool = "unknown_tool"
     case wallBlocked = "wall_blocked", buildBlocked = "build_blocked"
-    case occupied, missingIngredients = "missing_ingredients", unreachable
+    case occupied, missingIngredients = "missing_ingredients", unreachable, interrupted
 
     var success: Bool {
         switch self {
@@ -139,7 +139,7 @@ enum ActionOutcome: String, Codable, Sendable {
              .messageSent, .memoryUpdated, .finished, .inspected: true
         case .boundary, .waterBlocked, .treeBlocked, .blockUnavailable, .itemAbsent, .itemNotCarried,
              .invalidArguments, .unknownTool, .visionUnavailable, .wallBlocked, .buildBlocked, .occupied, .missingIngredients,
-             .unreachable: false
+             .unreachable, .interrupted: false
         }
     }
 }
@@ -386,33 +386,29 @@ struct World: Equatable, Sendable {
 
     mutating func interact(at target: Position, standingAt requestedStand: Position? = nil,
                            action: (Direction) -> WorldAction)
-        -> (outcome: ActionOutcome, walked: [World], actions: [WorldAction]) {
-        guard tile(at: target) != nil else { return (.boundary, [], []) }
+        -> (outcome: ActionOutcome, actions: [WorldAction]) {
+        guard tile(at: target) != nil else { return (.boundary, []) }
         let reachable = reachability()
         let stand: (position: Position, facing: Direction)
         if let requestedStand {
             guard tile(at: requestedStand) != nil,
                   let side = Direction.allCases.first(where: { target.neighbor($0) == requestedStand }) else {
-                return (.invalidArguments, [], [])
+                return (.invalidArguments, [])
             }
             stand = (requestedStand, side.opposite)
         } else {
-            guard let nearest = reachable.closestStand(to: target) else { return (.unreachable, [], []) }
+            guard let nearest = reachable.closestStand(to: target) else { return (.unreachable, []) }
             stand = (nearest.position, nearest.facing)
         }
-        guard let route = reachable.route(to: stand.position) else { return (.unreachable, [], []) }
+        guard let route = reachable.route(to: stand.position) else { return (.unreachable, []) }
 
         var projected = self
-        var walked: [World] = []
-        for direction in route {
-            _ = projected.apply(.move(direction))
-            walked.append(projected)
-        }
+        projected.avatar = stand.position
         let interaction = action(stand.facing)
         let outcome = projected.apply(interaction)
-        guard outcome.success else { return (outcome, [], []) }
+        guard outcome.success else { return (outcome, []) }
         self = projected
-        return (outcome, walked, route.map(WorldAction.move) + [interaction])
+        return (outcome, route.map(WorldAction.move) + [interaction])
     }
 
     mutating func apply(_ action: WorldAction) -> ActionOutcome {

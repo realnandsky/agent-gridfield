@@ -162,9 +162,25 @@ private struct GameView: View {
                 Spacer(minLength: 12)
 
                 if session.isRunning {
-                    Text(debugger.exchanges.last?.outcome.liveLabel ?? "Running actions")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        if session.hasActiveIntent {
+                            Text("Executing intent")
+                        }
+                        if let status = debugger.exchanges.last?.outcome.liveLabel {
+                            Text(status)
+                        } else if !session.hasActiveIntent {
+                            Text("Waiting for agent")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                if session.hasActiveIntent {
+                    Button("Interrupt Intent", systemImage: "hand.raised", action: session.interruptIntent)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Keep changes already made and ask the agent to replan")
                 }
 
                 HStack(spacing: 8) {
@@ -174,6 +190,7 @@ private struct GameView: View {
                     Button("Stop", action: session.stop)
                         .buttonStyle(.bordered)
                         .disabled(!session.isRunning)
+                        .help("Interrupt the agent and keep changes already made to the world")
                 }
                 .controlSize(.regular)
             }

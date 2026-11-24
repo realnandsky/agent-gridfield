@@ -45,9 +45,10 @@ open -n "$PWD/dist/GridWorld.app" --args --debug-dir "$trace_root/session"
 
 After the app opens, read `"$trace_root/session/state.json"` or follow `"$trace_root/session/events.jsonl"`.
 
-- `state.json` records the latest applied state, including the task goal, additional instructions, model settings, both map layers, avatar, inventory, notebook, character messages, vision call count, errors, and batch progress. Loose and attached items have separate counts. Each update replaces the file as a whole.
-- `events.jsonl` records each event with a time and sequence number. Use `exchangeID` to connect requests, streaming updates, responses or failures, and projected batch receipts. Use the tool call ID and zero-based action index to find outcomes actually applied to the world. An interrupted batch retains both its projected receipt and its actual progress. The final streaming update contains the assembled response.
+- `state.json` records the latest applied state, including the task goal, additional instructions, model settings, both map layers, avatar, inventory, notebook, character messages, vision call count, errors, and intent progress. In `schemaVersion` 4, `worldTick` counts ticks since the world was created or reset. While waiting for a model response or a local plan, the snapshot samples the clock about once per second. The phase `executing_intent` indicates an active intent. Loose and attached items have separate counts. Each update replaces the file as a whole.
+- `events.jsonl` records each event with a time and sequence number. Use `exchangeID` to connect API requests, streaming updates, responses, failures, and the intents they produce. `intent_started` and `intent_ended` mark the execution boundaries. Use the tool call ID and zero-based action index to follow progress through physical steps and action outcomes. The final streaming update contains the assembled response.
 - `walk_step` records each cell traversed, with the action index, one-based step number, and avatar coordinates. `plan_step` records the other physical steps of `build_blueprint` and `acquire`, with their one-based step numbers and an `action` containing the action description and outcome. `action_processed` records the outcome for the original action.
+- `model_woken` records the tick and reason for a new decision. The reason is `start`, `tool_results`, `intent_failed`, or `intent_interrupted`.
 - `tool_processed` records receipts for individual tools. `vision_called` records the vision ID and frame dimensions, along with the tool call ID and source exchange for agent-requested maps. The initial scan has `openingScan: true`. The subsequent `api_request` uses `visionID` for the first frame it carries and `additionalVisionIDs` for any further frames.
 
 API records use the same key and header redaction as the debugger. Clearing API history during a trace adds a journal event. Trace files may still contain goals, prompts, and model output. They are intended for local debugging.
@@ -60,7 +61,9 @@ The map is 17 columns by 12 rows. The character moves one cell at a time in four
 - `craft` uses inventory items. One log makes four planks. Two grass and two planks make one grass bed.
 - `place` builds on a cleared neighboring grass tile. Planks become floors or walls. A `wall` joins orthogonally adjacent walls, forming corners where they meet. Grass beds can sit on grass or floors.
 
-The agent submits ordered action batches with `act`. The app validates a batch and projects its outcome, then plays each action on the map. Playback intervals range from 180 to 400 ms based on the time spent generating the batch and the number of steps. The model can plan the next batch during playback. A failed action skips the rest of the batch. The receipt includes the attempted outcomes, skipped count, and final observation. **Stop** cancels pending requests and any remaining playback. Completed actions stay applied.
+During a run, the world clock advances eight times per second, including while a model request is pending. The agent submits an ordered list of actions with `act`. The local engine treats that list as an intent and advances it one step at a time against the live world. A walking step takes one tick regardless of model response time. The avatar waits when there is no intent to execute.
+
+A failed action skips the rest of the intent. The receipt includes the attempted outcomes, skipped count, and current observation. When the current tool calls resolve, their receipts trigger the next model request. **Interrupt Intent** cancels the active intent, skips the remaining calls in that response, and wakes the model with receipts from the current world so it can replan. **Stop** ends the run and cancels both the active intent and any pending model request. Steps already applied stay in the world in either case.
 
 ### Blueprints and inventory targets
 
@@ -83,7 +86,7 @@ The engine clears trees and bushes on the footprint, opens paths through trees w
 
 `acquire` takes an `item` and a positive integer `count` for the desired inventory total. For example, `{"action":"acquire","item":"grass_bed","count":2}` asks the engine to bring the number of carried grass beds to two. The engine uses existing inventory, finds reachable resources, and runs recipes as needed. A recipe's batch yield can leave extra items.
 
-Both actions play actual steps on the map, including walking, felling trees, picking up items, crafting, and placing blocks. They report one result per action, `built` or `acquired` on success. The `plans` array gives the zero-based action `index`, number of physical `steps`, and an optional `failure` with a `reason`. Failure details can include a `[x,y]` `position`, `item`, and `needed` and `available` quantities. An infeasible plan leaves the world as it was before that action. If the player stops during playback, steps already applied stay in the world.
+Both actions advance through steps on the map, including walking, felling trees, picking up items, crafting, and placing blocks. They report one result per action, `built` or `acquired` on success. The `plans` array gives the zero-based action `index`, number of physical `steps`, and an optional `failure` with a `reason`. Failure details can include a `[x,y]` `position`, `item`, and `needed` and `available` quantities. When a plan is infeasible at the start, the action leaves the world unchanged. If the player stops mid-action, the steps already applied stay in the world.
 
 ### Direct actions
 
@@ -100,7 +103,7 @@ Both actions play actual steps on the map, including walking, felling trees, pic
 
 A successful walk yields one `arrived` outcome in `results`. The `walks` array lists its action index, destination, and number of steps. The step count is zero when the agent is already there. A blocked route returns `unreachable`. An out-of-bounds destination returns `boundary`.
 
-`collect_at` and `place_at` take integer `x` and `y` and walk to the nearest reachable neighboring tile to perform their action. `collect_at` shares the targeting and quantity fields of `collect`. `place_at` takes a `structure` and can take an exact `stand` as `[x,y]`. The stand must be a reachable tile orthogonally adjacent to the placement target. A failed coordinate action leaves the avatar in place.
+`collect_at` and `place_at` take integer `x` and `y` and walk to the nearest reachable neighboring tile to perform their action. `collect_at` shares the targeting and quantity fields of `collect`. `place_at` takes a `structure` and can take an exact `stand` as `[x,y]`. The stand must be a reachable tile orthogonally adjacent to the placement target. A coordinate action that fails its initial checks leaves the avatar in place.
 
 For `craft` and item collection, `count` is an optional positive integer that defaults to 1. In `craft`, it counts recipe runs. For example, `{"action":"craft","item":"plank","count":3}` uses three logs and produces twelve planks. In `collect` and `collect_at`, it applies to `target: "item"` and counts items collected from the same tile, with loose items taken first. Collection with `target: "above"` or `target: "ground"` acts on one block. If the requested quantity is unavailable, the whole action fails.
 
@@ -108,7 +111,7 @@ For `craft` and item collection, `count` is an optional positive integer that de
 
 The system prompt describes the tool parameters and world rules. The goal appears in the user message each turn. The agent can call `act`, `memory`, and optional `vision` multiple times in one response. The app executes calls in the returned order, and the next model request pairs each call with its own receipt. A `finish` action ends the run and skips any later calls. The character speaks in **Messages** through the `say` action. Plain Chat Completions text appears in the API debugger. If a model returns only text with finish reason `stop`, the app retries once with a protocol reminder and a text observation.
 
-An API observation includes `ground` and `above`, two 17 × 12 grids whose array indices are row coordinates. A row is a space-separated series of `x=ID` or `first..last=ID` values using the shared `legend`. Ranges are inclusive and each row covers every column, including grass and air. An example is `0=gr 1..7=wa 8..16=gr`. The encoding is `x_ranges_v1`. The debug state uses `schemaVersion` 3.
+An API observation includes `ground` and `above`, two 17 × 12 grids whose array indices are row coordinates. A row is a space-separated series of `x=ID` or `first..last=ID` values using the shared `legend`. Ranges are inclusive and each row covers every column, including grass and air. An example is `0=gr 1..7=wa 8..16=gr`. The encoding is `x_ranges_v1`.
 
 Floors occupy the ground layer. Trees, bushes, walls, and beds occupy the upper layer. An empty upper cell is `air`. `items` totals loose items and tree branches by cell and type. The observation also contains the avatar's location, inventory, and notebook. Coordinates start at `[0,0]` in the upper-left corner and increase to the east and south.
 
@@ -121,4 +124,4 @@ swift test --disable-xctest -Xswiftc -plugin-path \
   -Xswiftc "$(xcode-select -p)/usr/lib/swift/host/plugins/testing"
 ```
 
-Tests cover the map, inventory, compact observations, tool calls and feedback, character messages, vision frames, and interruption of requests and action batches.
+Tests cover the map, inventory, compact observations, tool calls and feedback, character messages, vision frames, world ticks, and interruption of requests and intents.

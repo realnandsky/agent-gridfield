@@ -70,7 +70,7 @@ func glmFlashContinuesAfterToolReceipt(streaming: Bool) async throws {
     let settings = try ModelSettings(address: "https://open.bigmodel.cn/api/paas/v4", model: "glm-5.3-flash",
                                      effort: .none, streaming: streaming)
     let debugger = APIDebugger()
-    let game = GameSession(actionDelay: .zero)
+    let game = GameSession(tickInterval: .zero)
     game.start(model: ChatCompletionsModel(
         endpoint: settings.endpoint, model: settings.model, apiKey: "test-only", taskGoal: "Note the doorway",
         reasoningEffort: settings.effort.requestValue, streaming: settings.streaming, session: session, debugger: debugger
@@ -204,7 +204,7 @@ func resetClearsTheWorldAndHistoryWhileCancelingTheRun() async throws {
     let trace = DebugTraceFiles()
     let export = try DebugExport(directory: trace.directory)
     defer { try? FileManager.default.removeItem(at: trace.directory) }
-    let game = GameSession(actionDelay: .zero, debugExport: export)
+    let game = GameSession(tickInterval: .zero, debugExport: export)
     let model = ScriptedTools([
         toolCall("note", .memory, #"{"text":"Keep the east door","set":{"door":"east"}}"#),
         batchCall("build", """
@@ -231,6 +231,8 @@ func resetClearsTheWorldAndHistoryWhileCancelingTheRun() async throws {
 
     #expect(task.isCancelled)
     #expect(!game.isRunning)
+    #expect(!game.hasActiveIntent)
+    #expect(game.worldTick == 0)
     #expect(game.world.avatar == Position(x: 8, y: 5))
     #expect(game.world.tile(at: Position(x: 9, y: 5))?.hasFloor == false)
     #expect(game.world.tile(at: Position(x: 8, y: 4))?.terrain == .tree)
@@ -248,73 +250,63 @@ func resetClearsTheWorldAndHistoryWhileCancelingTheRun() async throws {
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
-func modelPlansDuringPlaybackAndStopPreservesOnlyAppliedActions() async throws {
+func worldClockTicksDuringModelRequestAndWakesAfterCommittedActions() async throws {
     let trace = DebugTraceFiles()
     let export = try DebugExport(directory: trace.directory)
     defer { try? FileManager.default.removeItem(at: trace.directory) }
-    let game = GameSession(actionDelay: .seconds(10), debugExport: export)
+    let game = GameSession(debugExport: export)
     let model = SuspendedModel()
-    let start = game.world.avatar
-    let worldChanged = AsyncStream<Void> { continuation in
-        withObservationTracking {
-            _ = game.world
-        } onChange: {
-            continuation.yield(())
-            continuation.finish()
-        }
-    }
+    let initialWorld = game.world
 
     game.start(model: model)
     let task = try #require(game.task)
     await model.waitUntilRequested()
-    await model.respond(with: batchCall("in-progress", """
-        [{"action":"move","direction":"east"},{"action":"say","text":"Too late."},
-         {"action":"move","direction":"east"}]
-        """))
-    for await _ in worldChanged { break }
-    var nextReply: ToolReply?
-    for await reply in model.followUp.stream {
-        nextReply = reply
-        break
+    let initialTick = game.worldTick
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(3))
+    while game.worldTick < initialTick + 2, clock.now < deadline {
+        try await clock.sleep(for: .milliseconds(10))
     }
-    let reply = try #require(nextReply)
-    var projectedWorld = game.world
-    #expect(projectedWorld.apply(.move(.east)) == .moved)
-    #expect(reply.receipt.observation == projectedWorld.observation())
-    #expect(reply.receipt.results == [.moved, .messageSent, .moved])
-    let live = try trace.state()
-    #expect(live.phase == "playing_batch")
-    #expect(live.batch?.processed == 1)
-    #expect(live.observation.avatar == [start.x + 1, start.y])
-    #expect(live.observation.notebook.isEmpty)
-    #expect(live.messages.isEmpty)
-    game.stop()
+    #expect(game.worldTick >= initialTick + 2)
+    #expect(game.world == initialWorld)
+    #expect(await model.requestCount == 1)
+
+    await model.respond(with: batchCall("in-progress", """
+        [{"action":"walk_to","x":8,"y":3},{"action":"say","text":"Arrived."}]
+        """))
     await task.value
 
-    #expect(game.world.avatar == start.neighbor(.east))
-    #expect(game.notebook.isEmpty)
-    #expect(game.messages.isEmpty)
+    let replies = await model.replies
+    try #require(replies.count == 1)
+    #expect(await model.requestCount == 2)
+    #expect(replies[0].receipt.results == [.arrived, .messageSent])
+    #expect(replies[0].receipt.observation == game.world.observation())
+    #expect(game.world.avatar == Position(x: 8, y: 3))
+    #expect(game.messages.map(\.text) == ["Arrived."])
     #expect(!game.isRunning)
     #expect(game.issue == nil)
-    #expect(try trace.state().phase == "idle")
+
     let events = try trace.events()
-    let plan = try #require(events.first { $0.kind == "batch_projected" })
-    let receipt = try #require(plan.data["receipt"] as? [String: Any])
-    let projected = try #require(receipt["observation"] as? [String: Any])
-    #expect(projected["avatar"] as? [Int] == [start.x + 2, start.y])
-    #expect(events.filter { $0.kind == "action_processed" }.count == 1)
-    let end = try #require(events.last)
-    #expect(end.kind == "run_ended")
-    #expect(end.data["reason"] as? String == "stopped")
+    let wakes = events.filter { $0.kind == "model_woken" }
+    #expect(wakes.compactMap { $0.data["reason"] as? String } == ["start", "tool_results"])
+    let receipt = try #require(events.first { $0.kind == "tool_processed" })
+    let lastAction = try #require(events.last {
+        $0.kind == "action_processed" && $0.data["toolCallID"] as? String == "in-progress"
+    })
+    #expect(lastAction.sequence < receipt.sequence)
+    #expect(receipt.sequence < (wakes.last?.sequence ?? 0))
+    let walkTicks = events.filter { $0.kind == "walk_step" }.compactMap { $0.data["tick"] as? Int }
+    #expect(walkTicks.count == 4)
+    #expect(zip(walkTicks, walkTicks.dropFirst()).allSatisfy { $0.1 == $0.0 + 1 })
 }
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
-func stoppingWalkPreservesOnlyThePlayedSteps() async throws {
+func stoppingWalkPreservesOnlyTheAppliedSteps() async throws {
     let trace = DebugTraceFiles()
     let export = try DebugExport(directory: trace.directory)
     defer { try? FileManager.default.removeItem(at: trace.directory) }
-    let game = GameSession(actionDelay: .seconds(10), debugExport: export)
+    let game = GameSession(tickInterval: .milliseconds(250), debugExport: export)
     let model = SuspendedModel()
     let firstStep = AsyncStream<Void> { continuation in
         withObservationTracking {
@@ -345,13 +337,62 @@ func stoppingWalkPreservesOnlyThePlayedSteps() async throws {
     #expect(steps.first?.data["step"] as? Int == 1)
     #expect(steps.first?.data["index"] as? Int == 0)
     #expect(steps.first?.data["avatar"] as? [Int] == [9, 5])
-    #expect(!events.contains { $0.kind == "action_processed" })
+    #expect(events.last { $0.kind == "intent_ended" }?.data["reason"] as? String == "stopped")
+    #expect(events.last?.data["reason"] as? String == "stopped")
+    #expect(await model.requestCount == 1)
 }
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
-func plannedActionsPlayBackInOrderAndFailuresLeaveTheWorldUnchanged() async throws {
-    let game = GameSession(actionDelay: .zero)
+func interruptedIntentKeepsProgressAndWakesModelWithActualReceipts() async throws {
+    let trace = DebugTraceFiles()
+    let export = try DebugExport(directory: trace.directory)
+    defer { try? FileManager.default.removeItem(at: trace.directory) }
+    let game = GameSession(tickInterval: .milliseconds(250), debugExport: export)
+    let model = SuspendedModel()
+    let firstStep = AsyncStream<Void> { continuation in
+        withObservationTracking {
+            _ = game.world
+        } onChange: {
+            continuation.yield(())
+            continuation.finish()
+        }
+    }
+    game.start(model: model)
+    let task = try #require(game.task)
+    await model.waitUntilRequested()
+    await model.respond(with: [
+        batchCall("walk", """
+        [{"action":"walk_to","x":8,"y":3},{"action":"say","text":"Arrived."}]
+        """),
+        toolCall("remember", .memory, #"{"text":"Interrupted tools should not run."}"#),
+    ])
+    for await _ in firstStep { break }
+    #expect(game.hasActiveIntent)
+    game.interruptIntent()
+    #expect(game.isRunning)
+    await task.value
+
+    let replies = await model.replies
+    #expect(replies.map(\.call.id) == ["walk", "remember"])
+    #expect(replies.map(\.receipt.results) == [[.interrupted], [.interrupted]])
+    #expect(replies.first?.receipt.skipped == 1)
+    #expect(replies.first?.receipt.walks?.first?.steps == 1)
+    #expect(replies.allSatisfy { $0.receipt.observation == game.world.observation() })
+    #expect(game.world.avatar == Position(x: 9, y: 5))
+    #expect(game.messages.isEmpty)
+    #expect(game.notebook.isEmpty)
+    #expect(game.issue == nil)
+    #expect(game.toolActivity.prefix(2).map(\.needsAttention) == [true, true])
+    let events = try trace.events()
+    #expect(events.last { $0.kind == "model_woken" }?.data["reason"] as? String == "intent_interrupted")
+    #expect(events.contains { $0.kind == "intent_ended" && $0.data["reason"] as? String == "player_interrupted" })
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
+func plannedActionsRunInOrderAndFailuresLeaveTheWorldUnchanged() async throws {
+    let game = GameSession(tickInterval: .zero)
     let model = ScriptedTools([
         ToolCall(id: "obsolete", type: "function", function: .init(name: "query", arguments: "{}")),
         batchCall("build-and-gather", """
@@ -393,7 +434,7 @@ func plannedActionsPlayBackInOrderAndFailuresLeaveTheWorldUnchanged() async thro
 @MainActor
 @Test(.timeLimit(.minutes(1)))
 func placeAtUsesTheSpecifiedStand() async throws {
-    let game = GameSession(actionDelay: .zero)
+    let game = GameSession(tickInterval: .zero)
     let model = ScriptedTools([
         batchCall("prepare", """
         [{"action":"collect","direction":"north","target":"above"},
@@ -422,7 +463,7 @@ func placeAtUsesTheSpecifiedStand() async throws {
 @MainActor
 @Test(.timeLimit(.minutes(1)))
 func bulkCollectAndCraftUseOneResultPerAction() async throws {
-    let game = GameSession(actionDelay: .zero)
+    let game = GameSession(tickInterval: .zero)
     let model = ScriptedTools([
         batchCall("gather", """
         [{"action":"collect","direction":"north","target":"above"},
@@ -490,7 +531,7 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
     let export = try DebugExport(directory: trace.directory)
     defer { try? FileManager.default.removeItem(at: trace.directory) }
     let debugger = APIDebugger(debugExport: export)
-    let game = GameSession(actionDelay: .zero, debugExport: export)
+    let game = GameSession(tickInterval: .zero, debugExport: export)
     game.start(model: ChatCompletionsModel(
         endpoint: endpoint, model: "test-vision", apiKey: nil, taskGoal: "Inspect the map",
         streaming: false, visionEnabled: true, session: session, debugger: debugger
@@ -557,7 +598,7 @@ func multipleToolCallsRunInOrderAndReturnOneReceiptPerCall() async throws {
     defer { session.invalidateAndCancel() }
     let endpoint = try #require(URL(string: "https://model.example/multi-tool-test"))
     let debugger = APIDebugger()
-    let game = GameSession(actionDelay: .zero)
+    let game = GameSession(tickInterval: .zero)
     game.start(model: ChatCompletionsModel(
         endpoint: endpoint, model: "test-model", apiKey: nil, taskGoal: "Take a step and inspect the map",
         streaming: false, visionEnabled: true, session: session, debugger: debugger
@@ -616,7 +657,7 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
         endpoint: endpoint, model: "test-model", apiKey: "test-only", taskGoal: goal,
         session: session, debugger: debugger
     )
-    let game = GameSession(actionDelay: .zero, debugExport: export)
+    let game = GameSession(tickInterval: .zero, debugExport: export)
     game.updateDebugInputs(.init(goal: goal, instructions: "", address: endpoint.absoluteString,
                                  model: "test-model", reasoningEffort: "automatic", streaming: true))
     let initial = game.world.observation()
@@ -766,10 +807,13 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(responses.count == records.count)
     #expect(responses.first?["status"] as? Int == 200)
     #expect((responses.first?["body"] as? String)?.contains("call-0") == true)
-    let projected = events.filter { $0.kind == "batch_projected" }
-    #expect(projected.count == 4)
-    #expect(projected.first?.data["exchangeID"] as? String == apiRequests[1].data["id"] as? String)
-    #expect(events.filter { $0.kind == "tool_processed" }.count == 4)
+    let intents = events.filter { $0.kind == "intent_started" }
+    #expect(intents.count == 4)
+    let firstIntentBatch = intents.first?.data["batch"] as? [String: Any]
+    #expect(firstIntentBatch?["exchangeID"] as? String == apiRequests[1].data["id"] as? String)
+    #expect(events.filter { $0.kind == "tool_processed" }.count == 8)
+    let wakeReasons = events.filter { $0.kind == "model_woken" }.compactMap { $0.data["reason"] as? String }
+    #expect(wakeReasons.filter { $0 == "intent_failed" }.count == 2)
     let processed = results[1] + results[3] + results[6] + [.messageSent, .finished]
     #expect(events.filter { $0.kind == "action_processed" }.compactMap { $0.data["result"] as? String }
         == processed.map(\.rawValue))
@@ -990,26 +1034,24 @@ private actor ScriptedTools: CharacterModel {
 }
 
 private actor SuspendedModel: CharacterModel {
-    let followUp = AsyncStream<ToolReply>.makeStream()
-    private var action: CheckedContinuation<ToolCall, Never>?
+    private var action: CheckedContinuation<[ToolCall], Never>?
     private var requested: CheckedContinuation<Void, Never>?
-    private var previousRequest = false
+    private(set) var requestCount = 0
     private(set) var initialObservation: WorldObservation?
+    private(set) var replies: [ToolReply] = []
 
     func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
-        if previousRequest {
-            if case .result(let replies) = turn, let reply = replies.first { followUp.continuation.yield(reply) }
-            followUp.continuation.finish()
+        requestCount += 1
+        if requestCount > 1 {
+            if case .result(let results) = turn { replies.append(contentsOf: results) }
             return [batchCall("fallback", #"[{"action":"finish"}]"#)]
         }
-        previousRequest = true
         if case .initial(let observation, _) = turn { initialObservation = observation }
-        let call = await withCheckedContinuation { continuation in
+        return await withCheckedContinuation { continuation in
             action = continuation
             requested?.resume()
             requested = nil
         }
-        return [call]
     }
 
     func waitUntilRequested() async {
@@ -1018,7 +1060,11 @@ private actor SuspendedModel: CharacterModel {
     }
 
     func respond(with call: ToolCall) {
-        action?.resume(returning: call)
+        respond(with: [call])
+    }
+
+    func respond(with calls: [ToolCall]) {
+        action?.resume(returning: calls)
         action = nil
     }
 }

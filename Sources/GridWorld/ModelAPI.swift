@@ -360,8 +360,8 @@ struct ChatCompletionsModel: CharacterModel {
         The engine clears trees and bushes on the footprint, opens access through trees when necessary, gathers or crafts missing materials, and chooses placement order and reachable stands to avoid trapping the avatar. Multiple buildings can share one blueprint. Choose their layout using the observation.
         A floor and a grass bed can share a tile. Walls require bare ground. Existing matching structures count as placed. Water and conflicting structures block a placement.
         acquire takes a positive count and counts items already carried toward that total. The engine finds reachable resources and uses recipes as needed. Recipe yields can leave extra items.
-        Both actions plan against the current world and then play the actual movement, collection, crafting and construction. Success yields built or acquired. An infeasible plan leaves the world as it was before that action.
-        receipt.plans lists {index, steps, failure?} for plan actions. index is the zero-based action index. failure contains reason and may include position [x,y], item, needed and available.
+        Both actions plan against the current world. The engine executes individual steps on world ticks. Success yields built or acquired. An infeasible plan leaves the world as it was before that action.
+        receipt.plans lists {index, steps, failure?} for plan actions. steps counts executed steps. index is the zero-based action index. failure contains reason and may include position [x,y], item, needed and available.
 
         [Direct actions]
         direction = north | south | east | west
@@ -369,7 +369,7 @@ struct ChatCompletionsModel: CharacterModel {
         move = step into target; water, trees, walls and corners block movement
         walk_to = follow the shortest four-direction route to the exact [x,y] cell using the same movement rules
         collect_at and place_at walk to the nearest reachable neighboring cell and perform the action. place_at can specify an exact stand as [x,y], orthogonally adjacent to the target.
-        failed coordinate actions leave the avatar in place
+        a coordinate action that fails validation before moving leaves the avatar in place
         walk_to results: arrived (including zero steps), boundary (outside the map), unreachable (no route)
         drop = transfer 1 item from inventory to target
         For collect, collect_at and craft, count is a positive integer and defaults to 1. If there are too few items or ingredients, the action fails without transferring or crafting any.
@@ -398,10 +398,11 @@ struct ChatCompletionsModel: CharacterModel {
         [Turn]
         return one or more available tool calls and leave assistant content empty
         calls execute in the order returned, against the state left by earlier calls
-        the next request includes one receipt per call unless finish ends the run first
+        the next request arrives after the calls settle and includes one receipt per call unless finish ends the run first
         action batches stop at the first failure or finish; earlier effects persist
-        receipt = results (attempted outcomes in order), skipped (count), observation (final state)
-        receipt.walks, when present, lists successful walks as {index, destination: [x,y], steps}; index is zero-based
+        a player interruption returns interrupted, preserves executed steps, and skips pending actions and calls from that decision
+        receipt = results (outcomes in order), skipped (count), observation (actual state when the call settled)
+        receipt.walks, when present, gives {index, destination: [x,y], steps}; index is zero-based and steps counts cells actually traversed
         say = display nonempty text in game chat
         finish = end the current run
         """
