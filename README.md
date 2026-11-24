@@ -4,7 +4,7 @@ A simple, beautiful open-source sandbox for AI agents.
 
 Give an agent a goal and watch it gather resources, craft, and build in a small real-time grid world. The agent can design a blueprint, then let the game clear the site, gather materials, plan the build, and join adjacent walls. During a run, the world clock keeps going while the model thinks. Open Developer Tools to inspect its API requests, tool calls, notebook, and the maps it asks to see.
 
-The agent can request a blueprint in the background and keep responding or preparing the site while it waits. **Planning in background** appears in the status area during that request.
+The agent can request a blueprint in the background and keep responding or preparing the site while it waits. Live **Fast** and **Slow** status capsules show each brain's state, elapsed planning timer, and streaming preview, while a translucent ghost blueprint overlays the map until each tile is built. Developer Tools adds a synchronized **Fast / Slow / Engine** timeline and a **Plan** inspector tab.
 
 ![The agent gathers materials and builds a house. Developer Tools shows the final tool call and the map sent to the agent.](docs/demo.gif)
 

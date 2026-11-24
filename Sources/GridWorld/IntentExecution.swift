@@ -154,6 +154,12 @@ struct IntentExecution {
         return planID
     }
 
+    var currentBlueprintPlacements: [BlueprintPlacement]? {
+        guard let index = currentActionIndex,
+              case .buildBlueprint(let placements) = actions[index] else { return nil }
+        return placements
+    }
+
     mutating func useProposal(_ placements: [BlueprintPlacement]) {
         guard let index = currentActionIndex, case .applyPlan = actions[index] else { return }
         actions[index] = .buildBlueprint(placements)

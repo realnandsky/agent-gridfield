@@ -273,11 +273,11 @@ struct ChatCompletionsModel: CharacterModel {
                                toolStream: toolStream ? true : nil,
                                parallelToolCalls: isZhipu ? nil : true, store: isZhipu ? nil : false,
                                responseFormat: nil)
-        return try await send(body, attachments: attachments, brain: .fast)
+        return try await send(body, attachments: attachments, brain: .fast, wakeReason: context?.wakeReason.rawValue)
     }
 
     private func send(_ body: ChatRequest, attachments: [ImageAttachment], brain: APIExchange.Brain,
-                      planID: UUID? = nil) async throws -> (Data, UUID?) {
+                      planID: UUID? = nil, wakeReason: String? = nil) async throws -> (Data, UUID?) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         var request = URLRequest(url: endpoint)
@@ -304,7 +304,8 @@ struct ChatCompletionsModel: CharacterModel {
                 requestHeaders: debugHeaders(request.allHTTPHeaderFields ?? [:]),
                 requestBody: redacted(String(decoding: loggedPayload, as: UTF8.self)), brain: brain, planID: planID,
                 visionID: attachments.first?.vision.id,
-                additionalVisionIDs: attachments.count > 1 ? attachments.dropFirst().map(\.vision.id) : nil
+                additionalVisionIDs: attachments.count > 1 ? attachments.dropFirst().map(\.vision.id) : nil,
+                wakeReason: wakeReason
             )
             try await debugger.record(exchange, apiKey: apiKey)
             exchangeID = exchange.id

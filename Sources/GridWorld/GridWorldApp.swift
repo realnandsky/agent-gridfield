@@ -91,7 +91,7 @@ private struct GameView: View {
         .frame(minWidth: 640, minHeight: 480)
         .inspector(isPresented: $showDebug) {
             APIDebugView(debugger: debugger, session: session)
-                .inspectorColumnWidth(min: 315, ideal: 420, max: 720)
+                .inspectorColumnWidth(min: 340, ideal: 460, max: 780)
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -141,7 +141,7 @@ private struct GameView: View {
                 .controlSize(.small)
                 .help("Stop the current run and reset the map, character, and history")
 
-                WorldMap(world: session.world)
+                WorldMap(world: session.world, ghostPlacements: session.blueprintOverlay)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -159,25 +159,9 @@ private struct GameView: View {
                     .accessibilityElement(children: .combine)
                 }
 
-                Spacer(minLength: 12)
+                Spacer(minLength: 10)
 
-                if session.isRunning {
-                    VStack(alignment: .leading, spacing: 3) {
-                        if session.isPlanning {
-                            Text("Planning in background")
-                        }
-                        if session.hasActiveIntent {
-                            Text("Executing intent")
-                        }
-                        if let status = debugger.exchanges.last(where: { $0.brain == .fast })?.outcome.liveLabel {
-                            Text(status)
-                        } else if !session.hasActiveIntent && !session.isPlanning {
-                            Text("Waiting for agent")
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
+                DualBrainStatusView(session: session, debugger: debugger)
 
                 if session.canInterruptIntent {
                     Button("Interrupt Intent", systemImage: "hand.raised", action: session.interruptIntent)
@@ -197,7 +181,7 @@ private struct GameView: View {
                 }
                 .controlSize(.regular)
             }
-            .frame(width: 132)
+            .frame(width: 168)
             .padding(.vertical, 6)
         }
     }
@@ -221,6 +205,100 @@ private struct GameView: View {
         .init(goal: currentGoal, instructions: debugger.prompt, address: configuration.address,
               model: configuration.model, reasoningEffort: configuration.effort.rawValue,
               streaming: configuration.streaming, visionEnabled: configuration.allowsVision)
+    }
+}
+
+private struct DualBrainStatusView: View {
+    let session: GameSession
+    let debugger: APIDebugger
+
+    private var fastStatus: (label: String, color: Color, active: Bool) {
+        switch session.phase {
+        case .idle: ("Idle", Color.secondary.opacity(0.45), false)
+        case .awaitingModel: ("Thinking", .blue, true)
+        case .executingIntent: ("Executing", .cyan, true)
+        case .waitingForPlan: ("Waiting for plan", .teal.opacity(0.75), true)
+        }
+    }
+
+    private var activeSlowExchange: APIExchange? {
+        debugger.exchanges.last { $0.brain == .slow && $0.isLive }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            brainCapsule(title: "Fast", dotColor: fastStatus.color, active: fastStatus.active) {
+                Text(fastStatus.label)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(fastStatus.active ? .primary : .secondary)
+                    .lineLimit(1)
+            }
+
+            if session.isPlanning {
+                let slow = activeSlowExchange
+                let startDate = session.latestPlan?.startedAt ?? slow?.startedAt ?? Date()
+                let preview = slow?.livePreviewLine ?? slow?.outcome.liveLabel ?? "Waiting for response"
+                brainCapsule(title: "Slow", dotColor: .purple, active: true) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        TimelineView(.periodic(from: startDate, by: 0.1)) { context in
+                            let elapsed = max(0, context.date.timeIntervalSince(startDate))
+                            Text("Planning · \(APIExchange.formatDuration(elapsed))")
+                                .font(.caption.weight(.medium).monospacedDigit())
+                                .lineLimit(1)
+                        }
+                        Text(verbatim: preview)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+            } else if let pending = session.pendingPlanSummary {
+                brainCapsule(title: "Slow", dotColor: .orange, active: true) {
+                    Text(pending.placementCount == 1 ? "Plan Ready · 1 tile" : "Plan Ready · \(pending.placementCount) tiles")
+                        .font(.caption.weight(.medium).monospacedDigit())
+                        .lineLimit(1)
+                }
+            } else {
+                brainCapsule(title: "Slow", dotColor: Color.secondary.opacity(0.45), active: false) {
+                    Text("Idle")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+    }
+
+    private func brainCapsule<Content: View>(
+        title: String, dotColor: Color, active: Bool, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 7, height: 7)
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            active ? dotColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(
+                    active ? dotColor.opacity(0.32) : Color(nsColor: .separatorColor).opacity(0.6),
+                    lineWidth: 1
+                )
+        }
     }
 }
 

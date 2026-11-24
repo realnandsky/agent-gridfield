@@ -3,10 +3,11 @@ import SwiftUI
 
 struct WorldMap: View {
     let world: World
+    var ghostPlacements: [BlueprintPlacement] = []
 
     var body: some View {
         Canvas(opaque: true, colorMode: .nonLinear) { context, size in
-            drawWorld(in: context, step: size.width / CGFloat(world.width))
+            drawWorld(in: context, step: size.width / CGFloat(world.width), drawGhosts: true)
         }
         .aspectRatio(CGFloat(world.width) / CGFloat(world.height), contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -15,6 +16,13 @@ struct WorldMap: View {
                 .strokeBorder(.black.opacity(0.13), lineWidth: 1)
         }
         .accessibilityLabel("World map")
+    }
+
+    static func isPlacementSatisfied(_ placement: BlueprintPlacement, in world: World) -> Bool {
+        guard let tile = world.tile(at: placement.position) else { return true }
+        if placement.structure == .floor { return tile.hasFloor }
+        if placement.structure.blocksMovement { return tile.fixture?.blocksMovement == true }
+        return tile.fixture == placement.structure
     }
 
     @MainActor
@@ -29,7 +37,8 @@ struct WorldMap: View {
             context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(hex: 0xF2F3EC)))
             var map = context
             map.translateBy(x: margin, y: margin)
-            drawWorld(in: map, step: step)
+            // Never draw ghost blueprint overlays into model vision snapshots.
+            drawWorld(in: map, step: step, drawGhosts: false)
             map.stroke(Path(CGRect(x: 0, y: 0, width: mapWidth, height: mapHeight)),
                        with: .color(Color(hex: 0x667069)), lineWidth: 1)
 
@@ -58,7 +67,7 @@ struct WorldMap: View {
         return VisionFrame(png: data, width: image.width, height: image.height)
     }
 
-    private func drawWorld(in context: GraphicsContext, step: CGFloat) {
+    private func drawWorld(in context: GraphicsContext, step: CGFloat, drawGhosts: Bool) {
         for row in 0..<world.height {
             for column in 0..<world.width {
                 let position = Position(x: column, y: row)
@@ -69,10 +78,94 @@ struct WorldMap: View {
                 drawTile(tile, at: position, in: cell)
             }
         }
+        if drawGhosts, !ghostPlacements.isEmpty {
+            drawGhostPlacements(in: context, step: step)
+        }
         var avatar = context
         avatar.translateBy(x: CGFloat(world.avatar.x) * step, y: CGFloat(world.avatar.y) * step)
         avatar.scaleBy(x: step, y: step)
         drawAvatar(in: avatar)
+    }
+
+    private func drawGhostPlacements(in context: GraphicsContext, step: CGFloat) {
+        var floors: [Position] = []
+        var walls: [Position] = []
+        var beds: [Position] = []
+        var seenFloors: Set<Position> = []
+        var seenWalls: Set<Position> = []
+        var seenBeds: Set<Position> = []
+
+        for placement in ghostPlacements where !Self.isPlacementSatisfied(placement, in: world) {
+            let position = placement.position
+            if placement.structure == .floor {
+                if seenFloors.insert(position).inserted { floors.append(position) }
+            } else if placement.structure.blocksMovement {
+                if seenWalls.insert(position).inserted { walls.append(position) }
+            } else if placement.structure == .grassBed {
+                if seenBeds.insert(position).inserted { beds.append(position) }
+            }
+        }
+
+        for position in floors {
+            var cell = context
+            cell.translateBy(x: CGFloat(position.x) * step, y: CGFloat(position.y) * step)
+            cell.scaleBy(x: step, y: step)
+            drawGhostFloor(in: cell)
+        }
+        for position in walls {
+            var cell = context
+            cell.translateBy(x: CGFloat(position.x) * step, y: CGFloat(position.y) * step)
+            cell.scaleBy(x: step, y: step)
+            drawGhostWall(in: cell)
+        }
+        for position in beds {
+            var cell = context
+            cell.translateBy(x: CGFloat(position.x) * step, y: CGFloat(position.y) * step)
+            cell.scaleBy(x: step, y: step)
+            drawGhostBed(in: cell)
+        }
+    }
+
+    private func drawGhostFloor(in context: GraphicsContext) {
+        let rect = Path(roundedRect: CGRect(x: 0.04, y: 0.04, width: 0.92, height: 0.92), cornerRadius: 0.06)
+        context.fill(rect, with: .color(Color(hex: 0x3B82F6).opacity(0.22)))
+        let boardLines = Path { path in
+            path.move(to: CGPoint(x: 0.10, y: 0.36))
+            path.addLine(to: CGPoint(x: 0.90, y: 0.36))
+            path.move(to: CGPoint(x: 0.10, y: 0.68))
+            path.addLine(to: CGPoint(x: 0.90, y: 0.68))
+        }
+        context.stroke(boardLines, with: .color(Color(hex: 0x1D4ED8).opacity(0.28)), lineWidth: 0.028)
+        context.stroke(
+            rect,
+            with: .color(Color(hex: 0x2563EB).opacity(0.62)),
+            style: StrokeStyle(lineWidth: 0.045, lineCap: .round, dash: [0.14, 0.10])
+        )
+    }
+
+    private func drawGhostWall(in context: GraphicsContext) {
+        let rect = Path(roundedRect: CGRect(x: 0.06, y: 0.06, width: 0.88, height: 0.88), cornerRadius: 0.06)
+        context.fill(rect, with: .color(Color(hex: 0x6366F1).opacity(0.28)))
+        var hatched = context
+        hatched.clip(to: rect)
+        let hatch = Path { path in
+            for offset in stride(from: -0.9, through: 0.9, by: 0.28) {
+                path.move(to: CGPoint(x: offset, y: 0.96))
+                path.addLine(to: CGPoint(x: offset + 0.92, y: 0.04))
+            }
+        }
+        hatched.stroke(hatch, with: .color(Color(hex: 0x4F46E5).opacity(0.48)), lineWidth: 0.048)
+        context.stroke(rect, with: .color(Color(hex: 0x4338CA).opacity(0.80)), lineWidth: 0.065)
+    }
+
+    private func drawGhostBed(in context: GraphicsContext) {
+        let frame = Path(roundedRect: CGRect(x: 0.22, y: 0.10, width: 0.56, height: 0.80), cornerRadius: 0.07)
+        let pillow = Path(roundedRect: CGRect(x: 0.31, y: 0.19, width: 0.38, height: 0.17), cornerRadius: 0.05)
+        context.fill(frame, with: .color(Color(hex: 0x0EA5E9).opacity(0.26)))
+        context.fill(pillow, with: .color(Color.white.opacity(0.45)))
+        let outlineStyle = StrokeStyle(lineWidth: 0.055, lineCap: .round, dash: [0.12, 0.08])
+        context.stroke(frame, with: .color(Color(hex: 0x1D4ED8).opacity(0.78)), style: outlineStyle)
+        context.stroke(pillow, with: .color(Color(hex: 0x1D4ED8).opacity(0.78)), style: outlineStyle)
     }
 
     private func drawTile(_ tile: Tile, at position: Position, in context: GraphicsContext) {

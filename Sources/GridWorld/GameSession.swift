@@ -9,6 +9,90 @@ struct PlanSummary: Encodable, Sendable {
     let bounds: [[Int]]
 }
 
+struct TimelineEngineSegment: Identifiable, Equatable, Sendable {
+    enum Kind: String, Equatable, Sendable {
+        case intent
+        case waitingForPlan
+    }
+
+    enum Status: String, Equatable, Sendable {
+        case running
+        case completed
+        case failed
+        case interrupted
+        case stopped
+    }
+
+    let id: UUID
+    let kind: Kind
+    let label: String
+    let startedAt: Date
+    var endedAt: Date?
+    var status: Status
+    let exchangeID: UUID?
+
+    init(
+        id: UUID = UUID(), kind: Kind, label: String, startedAt: Date = Date(),
+        endedAt: Date? = nil, status: Status = .running, exchangeID: UUID? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.label = label
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.status = status
+        self.exchangeID = exchangeID
+    }
+}
+
+struct TimelinePlanHandoff: Identifiable, Equatable, Sendable {
+    enum Outcome: String, Equatable, Sendable {
+        case ready
+        case failed
+        case cancelled
+    }
+
+    let id: UUID
+    let planID: UUID
+    let at: Date
+    let outcome: Outcome
+    let placementCount: Int?
+    let reason: String?
+
+    init(
+        id: UUID = UUID(), planID: UUID, at: Date = Date(), outcome: Outcome,
+        placementCount: Int? = nil, reason: String? = nil
+    ) {
+        self.id = id
+        self.planID = planID
+        self.at = at
+        self.outcome = outcome
+        self.placementCount = placementCount
+        self.reason = reason
+    }
+}
+
+struct PlanRecord: Identifiable, Equatable, Sendable {
+    enum Status: String, Equatable, Sendable {
+        case planning = "Planning"
+        case ready = "Ready"
+        case applied = "Applied"
+        case failed = "Failed"
+        case cancelled = "Cancelled"
+    }
+
+    let id: UUID
+    let brief: String
+    let startedAt: Date
+    var finishedAt: Date?
+    var status: Status
+    var createdTick: UInt64?
+    var placementCount: Int?
+    var bounds: [[Int]]?
+    var summary: String?
+    var failureReason: String?
+}
+
 struct ModelContext: Encodable, Sendable {
     let worldTick: UInt64
     let wakeReason: GameSession.WakeReason
@@ -63,6 +147,7 @@ final class GameSession {
         var planning: Task<Void, Never>?
         var applyingPlan: PlanSummary?
         var appliedPlan: PlanSummary?
+        var timelineSegmentID: UUID?
 
         init(call: ToolCall, activityIndex: Int, continuation: CheckedContinuation<ToolReply, any Error>) {
             self.call = call
@@ -98,7 +183,7 @@ final class GameSession {
         var visionEnabled = false
     }
 
-    private enum RunPhase: String, Encodable {
+    enum RunPhase: String, Encodable, Sendable {
         case idle
         case awaitingModel = "awaiting_model"
         case executingIntent = "executing_intent"
@@ -210,6 +295,18 @@ final class GameSession {
     private(set) var isRunning = false
     private(set) var hasActiveIntent = false
     private(set) var isPlanning = false
+    private(set) var phase: RunPhase = .idle
+    private(set) var runStartedAt: Date?
+    private(set) var runEndedAt: Date?
+    private(set) var engineSegments: [TimelineEngineSegment] = []
+    private(set) var planHandoffs: [TimelinePlanHandoff] = []
+    private(set) var planHistory: [PlanRecord] = []
+    var latestPlan: PlanRecord? { planHistory.last }
+    func planRecord(for id: UUID) -> PlanRecord? { planHistory.last { $0.id == id } }
+    var pendingPlanSummary: PlanSummary? { pendingPlan?.summary }
+    var blueprintOverlay: [BlueprintPlacement] {
+        activeBlueprintPlacements.isEmpty ? (pendingPlan?.placements ?? []) : activeBlueprintPlacements
+    }
     var canInterruptIntent: Bool { hasActiveIntent || isPlanning || pendingPlan != nil }
     @ObservationIgnored private(set) var worldTick: UInt64 = 0
     var issue: String? {
@@ -226,7 +323,6 @@ final class GameSession {
     private let tickInterval: Duration
     private let debugExport: DebugExport?
     @ObservationIgnored private var debugInputs: DebugInputs?
-    @ObservationIgnored private var phase: RunPhase = .idle
     @ObservationIgnored private var batchProgress: BatchProgress?
     @ObservationIgnored private var activeIntent: ActiveIntent?
     @ObservationIgnored private var runID: UUID?
@@ -235,6 +331,8 @@ final class GameSession {
     @ObservationIgnored private var fastDecision: FastDecision?
     @ObservationIgnored private var planner: PlannerWork?
     private var pendingPlan: SavedPlan?
+    private var activeBlueprintPlacements: [BlueprintPlacement] = []
+    @ObservationIgnored private var activeWaitSegmentID: UUID?
     @ObservationIgnored private var planFailure: String?
     @ObservationIgnored private var plannerWake: WakeReason?
     @ObservationIgnored private var controlWake: WakeReason?
@@ -268,6 +366,13 @@ final class GameSession {
         runID = id
         isRunning = true
         phase = .awaitingModel
+        runStartedAt = Date()
+        runEndedAt = nil
+        engineSegments.removeAll()
+        planHandoffs.removeAll()
+        planHistory.removeAll()
+        activeBlueprintPlacements.removeAll()
+        activeWaitSegmentID = nil
         issue = nil
         debugExport?.event("run_started", ["runID": id])
         exportState()
@@ -309,6 +414,13 @@ final class GameSession {
         notebook = ""
         memoryEntries.removeAll()
         recentHistory = RecentHistory()
+        runStartedAt = nil
+        runEndedAt = nil
+        engineSegments.removeAll()
+        planHandoffs.removeAll()
+        planHistory.removeAll()
+        activeBlueprintPlacements.removeAll()
+        activeWaitSegmentID = nil
         issue = nil
         debugExport?.event("world_reset", [String: String]())
         exportState()
@@ -319,6 +431,13 @@ final class GameSession {
         let endingBatch = batchProgress
         clearPlanning(run: runID, reason: reason)
         interruptActiveIntent(run: runID, reason: reason)
+        activeBlueprintPlacements.removeAll()
+        let endTime = Date()
+        let fallbackStatus: TimelineEngineSegment.Status = reason == "finished" ? .completed : .stopped
+        for index in engineSegments.indices where engineSegments[index].endedAt == nil {
+            engineSegments[index].endedAt = endTime
+            engineSegments[index].status = fallbackStatus
+        }
         debugExport?.event("run_ended", RunEnd(runID: runID, reason: reason, batch: endingBatch))
         self.runID = nil
         isRunning = false
@@ -331,6 +450,7 @@ final class GameSession {
         controlWake = nil
         consecutiveIntentFailures = 0
         phase = .idle
+        runEndedAt = endTime
         exportState()
         debugExport?.closeRun()
     }
@@ -433,8 +553,8 @@ final class GameSession {
                 }
                 previousReplies = replies
                 if controlWake == nil, wake == .toolResults,
-                   replies.contains(where: { $0.receipt.results.contains(.waitingForPlan) }) {
-                    await waitForPlanner()
+                   let waitReply = replies.first(where: { $0.receipt.results.contains(.waitingForPlan) }) {
+                    await waitForPlanner(exchangeID: waitReply.call.debugExchangeID)
                 }
             }
         } catch {
@@ -471,7 +591,7 @@ final class GameSession {
         fastDecision = nil
     }
 
-    private func waitForPlanner() async {
+    private func waitForPlanner(exchangeID: UUID?) async {
         await withCheckedContinuation { continuation in
             guard isPlanning, controlWake == nil, !Task.isCancelled else {
                 continuation.resume()
@@ -479,11 +599,23 @@ final class GameSession {
             }
             plannerWaiter = continuation
             phase = .waitingForPlan
+            let segment = TimelineEngineSegment(
+                kind: .waitingForPlan, label: "wait_for_plan", startedAt: Date(),
+                status: .running, exchangeID: exchangeID
+            )
+            activeWaitSegmentID = segment.id
+            engineSegments.append(segment)
             exportState()
         }
     }
 
-    private func signalPlanner() {
+    private func signalPlanner(status: TimelineEngineSegment.Status = .completed) {
+        if let waitID = activeWaitSegmentID,
+           let index = engineSegments.lastIndex(where: { $0.id == waitID && $0.endedAt == nil }) {
+            engineSegments[index].endedAt = Date()
+            engineSegments[index].status = status
+        }
+        activeWaitSegmentID = nil
         let waiter = plannerWaiter
         plannerWaiter = nil
         waiter?.resume()
@@ -612,6 +744,10 @@ final class GameSession {
         }
         planner = PlannerWork(id: planID, task: task, vision: vision)
         isPlanning = true
+        planHistory.append(PlanRecord(
+            id: planID, brief: request.brief, startedAt: Date(), finishedAt: nil, status: .planning,
+            createdTick: nil, placementCount: nil, bounds: nil, summary: nil, failureReason: nil
+        ))
         return planID
     }
 
@@ -619,45 +755,79 @@ final class GameSession {
         guard runID == id, planner?.id == planID else { return }
         planner = nil
         isPlanning = false
+        let now = Date()
         switch result {
         case .success(let proposal):
             if let failure = BlueprintPlanner.layoutFailure(proposal.placements, in: world) {
                 let position = failure.position.map { " [\($0[0]),\($0[1])]" } ?? ""
-                failPlanner(failure.reason + position, planID: planID, run: id)
+                failPlanner(failure.reason + position, planID: planID, run: id, at: now)
             } else if let bounds = BlueprintPlacement.bounds(of: proposal.placements) {
                 let summary = PlanSummary(planID: planID, createdTick: worldTick, summary: proposal.summary,
                                           placementCount: proposal.placements.count, bounds: bounds)
                 pendingPlan = SavedPlan(summary: summary, placements: proposal.placements)
                 plannerWake = .planReady
+                if let index = planHistory.lastIndex(where: { $0.id == planID }) {
+                    planHistory[index].status = .ready
+                    planHistory[index].finishedAt = now
+                    planHistory[index].createdTick = worldTick
+                    planHistory[index].placementCount = summary.placementCount
+                    planHistory[index].bounds = bounds
+                    planHistory[index].summary = summary.summary
+                }
+                planHandoffs.append(TimelinePlanHandoff(
+                    planID: planID, at: now, outcome: .ready, placementCount: summary.placementCount
+                ))
                 debugExport?.planner(.completed, runID: id, planID: planID, tick: worldTick,
                                      outcome: "ready", placementCount: summary.placementCount)
             }
         case .failure(let error):
-            failPlanner(error.localizedDescription, planID: planID, run: id)
+            failPlanner(error.localizedDescription, planID: planID, run: id, at: now)
         }
-        signalPlanner()
+        signalPlanner(status: .completed)
         exportState()
     }
 
-    private func failPlanner(_ reason: String, planID: UUID, run id: UUID) {
+    private func failPlanner(_ reason: String, planID: UUID, run id: UUID, at now: Date = Date()) {
         planFailure = reason
         plannerWake = .planFailed
+        if let index = planHistory.lastIndex(where: { $0.id == planID }) {
+            planHistory[index].status = .failed
+            planHistory[index].finishedAt = now
+            planHistory[index].failureReason = reason
+        }
+        planHandoffs.append(TimelinePlanHandoff(
+            planID: planID, at: now, outcome: .failed, reason: reason
+        ))
         debugExport?.planner(.completed, runID: id, planID: planID, tick: worldTick,
                              outcome: "failed", reason: reason)
     }
 
     private func clearPlanning(run id: UUID, reason: String) {
+        let now = Date()
         if let planner {
             planner.task.cancel()
             planner.vision?.update(.cancelled)
+            if let index = planHistory.lastIndex(where: { $0.id == planner.id }) {
+                planHistory[index].status = .cancelled
+                planHistory[index].finishedAt = now
+                planHistory[index].failureReason = reason
+            }
+            planHandoffs.append(TimelinePlanHandoff(
+                planID: planner.id, at: now, outcome: .cancelled, reason: reason
+            ))
             debugExport?.planner(.cancelled, runID: id, planID: planner.id, tick: worldTick, reason: reason)
+        } else if let pending = pendingPlan,
+                  let index = planHistory.lastIndex(where: { $0.id == pending.summary.planID && $0.status == .ready }) {
+            planHistory[index].status = .cancelled
+            planHistory[index].failureReason = reason
         }
         planner = nil
         isPlanning = false
         pendingPlan = nil
         planFailure = nil
         plannerWake = nil
-        signalPlanner()
+        let waitStatus: TimelineEngineSegment.Status = (reason == "stopped" || reason == "reset") ? .stopped : .interrupted
+        signalPlanner(status: waitStatus)
     }
 
     private func recordTool(_ call: ToolCall, receipt: ToolReceipt, run id: UUID) {
@@ -680,6 +850,24 @@ final class GameSession {
                 return
             }
             let intent = ActiveIntent(call: call, activityIndex: activityIndex, continuation: continuation)
+            let actions = (try? call.decodeBatch().actions) ?? []
+            let isPureWait = actions.count == 1 && {
+                if case .waitForPlan = actions[0] { return true }
+                return false
+            }()
+            let canWait = isPlanning || plannerWake != nil
+            if !(isPureWait && canWait) {
+                let segment = TimelineEngineSegment(
+                    kind: .intent,
+                    label: Self.intentLabel(for: actions),
+                    startedAt: Date(),
+                    status: .running,
+                    exchangeID: call.debugExchangeID
+                )
+                intent.timelineSegmentID = segment.id
+                engineSegments.append(segment)
+            }
+            activeBlueprintPlacements = intent.execution.currentBlueprintPlacements ?? []
             activeIntent = intent
             hasActiveIntent = true
             phase = .executingIntent
@@ -699,8 +887,10 @@ final class GameSession {
         }
 
         if let planID = intent.execution.requestedPlanID, let pendingPlan, pendingPlan.summary.planID == planID {
-            intent.execution.useProposal(pendingPlan.placements)
+            let placements = pendingPlan.placements
+            intent.execution.useProposal(placements)
             intent.applyingPlan = pendingPlan.summary
+            activeBlueprintPlacements = placements
             self.pendingPlan = nil
             plannerWake = nil
         }
@@ -723,6 +913,9 @@ final class GameSession {
         guard let update = intent.execution.advance(world: &liveWorld, canWaitForPlan: canWait) else { return }
         if world != liveWorld { world = liveWorld }
         recordProgress(update, for: intent, run: id)
+        if update.outcome != nil {
+            activeBlueprintPlacements = intent.execution.currentBlueprintPlacements ?? []
+        }
         if intent.execution.isComplete {
             finishIntent(intent, run: id, reason: update.outcome?.success == true ? "completed" : "failed")
         } else {
@@ -763,6 +956,18 @@ final class GameSession {
             intent.history.append(history)
         }
         if let outcome = update.outcome {
+            if let plan = intent.applyingPlan,
+               let index = planHistory.lastIndex(where: { $0.id == plan.planID }) {
+                if outcome == .built {
+                    planHistory[index].status = .applied
+                } else if outcome == .interrupted {
+                    planHistory[index].status = .cancelled
+                    planHistory[index].failureReason = "Interrupted"
+                } else if !outcome.success {
+                    planHistory[index].status = .failed
+                    planHistory[index].failureReason = "Apply failed (\(outcome.rawValue))"
+                }
+            }
             intent.applyingPlan = nil
             batchProgress?.processed = intent.execution.results.count
             debugExport?.event("action_processed", ActionEvent(runID: id, toolCallID: intent.call.id, index: update.index,
@@ -772,6 +977,12 @@ final class GameSession {
 
     private func finishIntent(_ intent: ActiveIntent, run id: UUID, reason: String) {
         intent.planning?.cancel()
+        activeBlueprintPlacements.removeAll()
+        if let segmentID = intent.timelineSegmentID,
+           let index = engineSegments.lastIndex(where: { $0.id == segmentID && $0.endedAt == nil }) {
+            engineSegments[index].endedAt = Date()
+            engineSegments[index].status = Self.timelineSegmentStatus(for: reason)
+        }
         var receipt = intent.execution.receipt(
             observation: world.observation(notebook: notebook),
             memory: MemoryReceipt(entries: memoryEntries, update: nil),
@@ -799,6 +1010,48 @@ final class GameSession {
         phase = .awaitingModel
         exportState()
         intent.continuation.resume(returning: ToolReply(call: intent.call, receipt: receipt))
+    }
+
+    private static func timelineSegmentStatus(for reason: String) -> TimelineEngineSegment.Status {
+        switch reason {
+        case "completed": .completed
+        case "stopped", "reset": .stopped
+        case "player_interrupted", "player_input", "superseded": .interrupted
+        default: .failed
+        }
+    }
+
+    private static func intentLabel(for actions: [CharacterAction]) -> String {
+        guard !actions.isEmpty else { return "intent" }
+        var groups: [(label: String, count: Int)] = []
+        for action in actions {
+            let label: String
+            switch action {
+            case .applyPlan: label = "apply_plan"
+            case .buildBlueprint(let placements): label = "build_blueprint (\(placements.count))"
+            case .acquire(let item, let count): label = "acquire \(count) \(item.rawValue)"
+            case .walkTo(let pos): label = "walk_to [\(pos.x),\(pos.y)]"
+            case .collectAt(let pos, _, _): label = "collect_at [\(pos.x),\(pos.y)]"
+            case .placeAt(let pos, let structure, _): label = "place \(structure.rawValue) [\(pos.x),\(pos.y)]"
+            case .waitForPlan: label = "wait_for_plan"
+            case .say: label = "say"
+            case .world(.move): label = "move"
+            case .world(.collect): label = "collect"
+            case .world(.drop): label = "drop"
+            case .world(.craft(let recipe, _)): label = "craft \(recipe.rawValue)"
+            case .world(.place(_, let structure)): label = "place \(structure.rawValue)"
+            case .world(.finish): label = "finish"
+            case .invalid: label = "invalid"
+            }
+            if let last = groups.last, last.label == label {
+                groups[groups.count - 1].count += 1
+            } else {
+                groups.append((label, 1))
+            }
+        }
+        let parts = groups.map { $0.count > 1 ? "\($0.label) ×\($0.count)" : $0.label }
+        if parts.count <= 3 { return parts.joined(separator: " + ") }
+        return parts.prefix(2).joined(separator: " + ") + " + \(parts.count - 2) more"
     }
 
     private func exportState() {

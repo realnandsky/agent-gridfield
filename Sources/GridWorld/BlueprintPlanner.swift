@@ -1,4 +1,4 @@
-struct BlueprintPlacement: Decodable, Sendable {
+struct BlueprintPlacement: Decodable, Equatable, Sendable {
     let x: Int
     let y: Int
     let structure: Structure
