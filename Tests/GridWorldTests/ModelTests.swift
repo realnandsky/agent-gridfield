@@ -555,7 +555,7 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
                 == ["act", "memory", "request_plan", "vision"])
         return try #require(json["messages"] as? [[String: Any]])
     }
-    #expect(bodies.map(\.count) == [2, 5, 4, 4, 5, 4])
+    #expect(bodies.map(\.count) == [2, 5, 5, 4, 5, 4])
     for (call, requestIndex) in zip(calls, [0, 1, 4]) {
         let messages = bodies[requestIndex]
         let roles = call.openingScan ? ["system", "user"] : ["system", "user", "assistant", "tool", "user"]
@@ -680,7 +680,7 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(game.messages.map(\.sender) == ["Character", "Character", "Character"])
 
     let records = await StubChatEndpoint.service.records
-    try #require(records.count == 9)
+    try #require(records.count == 10)
     try #require(debugger.exchanges.count == records.count)
     for (exchange, record) in zip(debugger.exchanges, records) {
         #expect(exchange.requestBody == record.body.map { String(decoding: $0, as: UTF8.self) })
@@ -742,9 +742,13 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(placement.properties?["stand"] == nil)
     #expect(requests[0].messages[0].content?.contains("preview_build") == false)
     #expect(requests.allSatisfy { $0.toolChoice == "auto" })
-    #expect(requests[8].messages[0].content?.contains("previous response used plain text") == true)
-    #expect(Array(requests[8].messages.dropFirst().map(\.content)) ==
-            Array(requests[7].messages.dropFirst().map(\.content)))
+    for retry in requests.suffix(2) {
+        #expect(retry.messages.dropLast().map(\.content) == requests[7].messages.map(\.content))
+        #expect(retry.messages.last?.role == "user")
+        #expect(retry.messages.last?.content?.contains("Plain-text completion") == true)
+        #expect(retry.messages.last?.content?.contains(#"{"action":"finish"}"#) == true)
+    }
+    #expect(requests[9].messages.last?.content?.contains("last attempt") == true)
     #expect(debugger.exchanges[7].outcome.label == "HTTP 200")
 
     let results: [[ActionOutcome]] = [
@@ -759,7 +763,7 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     ]
     let skipped = [0, 2, 0, 1, 0, 0, 0]
     let updates: [String?] = ["applied", nil, "applied", nil, "invalid", "applied", nil]
-    for (index, request) in requests.dropFirst().dropLast().enumerated() {
+    for (index, request) in requests.dropFirst().dropLast(2).enumerated() {
         #expect(request.messages.map(\.role) == ["system", "user", "assistant", "tool"])
         let playerTurn = try decode(WirePlayerTurn.self, request.messages[1].content)
         #expect(playerTurn.goal == goal)
@@ -1294,7 +1298,7 @@ private actor StubChatService {
 
     func reply(to request: HTTPRecord) -> Data {
         records.append(request)
-        if records.count == 8 {
+        if (8...9).contains(records.count) {
             return Data(#"{"choices":[{"message":{"role":"assistant","content":"Plain-text completion"},"finish_reason":"stop"}]}"#.utf8)
         }
         let calls = [
@@ -1316,7 +1320,7 @@ private actor StubChatService {
             batchCall("call-6", #"[{"action":"say","text":"I picked up the log."}]"#),
             batchCall("call-7", #"[{"action":"say","text":"All done."},{"action":"finish"},{"action":"say","text":"Skipped after finish."}]"#),
         ]
-        let index = records.count < 8 ? records.count - 1 : records.count - 2
+        let index = records.count < 8 ? records.count - 1 : records.count - 3
         guard calls.indices.contains(index) else { return Data("{}".utf8) }
         let action = calls[index]
         let encoded = try! JSONEncoder().encode(action)

@@ -133,17 +133,28 @@ struct ChatCompletionsModel: CharacterModel {
     }
 
     func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
-        let first = try await request(turn)
-        do {
-            return try decodeCalls(first.0, exchangeID: first.1)
-        } catch ModelAPIError.textInsteadOfTool {
-            let retry = try await request(turn, retryingTextResponse: true)
+        var correction: String?
+        for attempt in 0...2 {
+            let (data, exchangeID) = try await request(turn, correction: correction)
             do {
-                return try decodeCalls(retry.0, exchangeID: retry.1)
-            } catch ModelAPIError.textInsteadOfTool {
-                throw ModelAPIError.noToolCall("stop")
+                return try decodeCalls(data, exchangeID: exchangeID)
+            } catch ModelAPIError.textInsteadOfTool(let draft) {
+                guard attempt < 2 else { throw ModelAPIError.noToolCall("stop") }
+                let feedback = attempt == 0
+                    ? "The engine received only a draft. No action ran and the player did not receive it."
+                    : "The retry also returned only text. This is the last attempt. Send a function tool call now."
+                correction = """
+                    \(feedback)
+                    Check the goal against the latest observation and receipts. If complete, call act once with these arguments:
+                    {"actions":[{"action":"say","text":"<your completion message to the player>"},{"action":"finish"}]}
+                    Use your draft for the say text if accurate. If work remains, call the appropriate next tool instead.
+                    Leave assistant content empty. Printing the arguments as chat text does not execute them.
+                    Previous unsent draft:
+                    \(draft.prefix(2000))
+                    """
             }
         }
+        throw ModelAPIError.noToolCall("stop")
     }
 
     func plan(brief: String, observation: WorldObservation, vision: VisionCall?, planID: UUID) async throws -> PlanProposal {
@@ -191,7 +202,7 @@ struct ChatCompletionsModel: CharacterModel {
         guard !calls.isEmpty else {
             if choice.finishReason == "stop", let content = message.content,
                !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                throw ModelAPIError.textInsteadOfTool
+                throw ModelAPIError.textInsteadOfTool(content)
             }
             throw ModelAPIError.noToolCall(choice.finishReason.map(redacted))
         }
@@ -205,7 +216,7 @@ struct ChatCompletionsModel: CharacterModel {
         }
     }
 
-    private func request(_ turn: ModelTurn, retryingTextResponse: Bool = false) async throws -> (Data, UUID?) {
+    private func request(_ turn: ModelTurn, correction: String?) async throws -> (Data, UUID?) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let prompt = await debugger?.prompt ?? ""
@@ -235,19 +246,16 @@ struct ChatCompletionsModel: CharacterModel {
             }
         }
         let frames = images.compactMap { image -> (vision: VisionCall, callID: String?, frame: VisionFrame)? in
-            guard visionEnabled, !retryingTextResponse, let frame = image.vision.frame else { return nil }
+            guard visionEnabled, correction == nil, let frame = image.vision.frame else { return nil }
             return (image.vision, image.callID, frame)
         }
         let userContent = try encoder.jsonString(PlayerTurn(
             goal: taskGoal, observation: observation, instructions: prompt.isEmpty ? nil : prompt,
             context: history.isEmpty ? context : nil
         ))
-        let retryReminder = retryingTextResponse
-            ? "\nYour previous response used plain text without a tool call. Submit at least one tool call now. Use act's say to speak and act's finish to end the run."
-            : ""
         let visionRules = visionEnabled ? Self.visionRules : ""
         var messages = [
-            ChatMessage(role: instructionRole, content: Self.rules + visionRules + retryReminder),
+            ChatMessage(role: instructionRole, content: Self.rules + visionRules),
             ChatMessage(role: "user", content: userContent),
         ] + history
         var attachments: [ImageAttachment] = []
@@ -265,6 +273,8 @@ struct ChatCompletionsModel: CharacterModel {
                 messages[1].imageURL = imageURL
             }
         }
+
+        if let correction { messages.append(ChatMessage(role: "user", content: correction)) }
 
         let toolStream = streaming && ModelSettings.isGLMFlash(host: endpoint.host, model: model)
         let tools = visionEnabled ? Self.tools + [.vision] : Self.tools
@@ -479,14 +489,14 @@ struct ChatCompletionsModel: CharacterModel {
 
         [Background planning]
         request_plan accepts a concise brief and optional include_vision (default false, available when vision is enabled).
-        The planner already receives the goal, player instructions, and observation. Keep the brief short and use it for extra design priorities.
+        The planner already receives the goal, player instructions, and observation. Write only design intent and style in brief. Leave site selection and all coordinates to the planner.
         Request a plan for complex layouts and multi-room designs. If context.planningSuggested is true after repeated failures, prioritize requesting a plan instead of retrying the same intent.
         When requesting a plan at the start or after player_input, pair request_plan with a short act say in the same response so the player hears from you right away. Save longer notes for later if useful.
         plan_requested means the planner has started in the background. A new request replaces the previous one.
-        While context.planInProgress is true, you can say something to the player, gather resources, or take other useful short actions. Use wait_for_plan as the last action in its batch only while a plan is in progress.
+        The engine automatically gathers and crafts blueprint materials. While context.planInProgress is true, call wait_for_plan immediately unless another short action has a clear benefit for the player’s goal. Skip speculative gathering. Use wait_for_plan as the last action in its batch only while a plan is in progress.
         A planner result wakes you if you are waiting. On plan_ready, inspect context.pendingPlan for planID, createdTick, summary, placementCount and bounds. Choose apply_plan if the proposal fits the goal. context.planFailure describes a failed request.
         Use apply_plan with the supplied planID to build the proposal. The engine consumes the proposal when the action starts and validates every saved placement against the current world. plan_unavailable means the ID is unavailable. You can ignore a proposal or replace it with a new request.
-        A built receipt with appliedPlan confirms that every placement in the saved design is present. Use appliedPlan.summary and the latest observation to check the player's requirements, then finish when they are met.
+        A built receipt with appliedPlan confirms that every placement in the saved design is present. Use appliedPlan.summary and the latest observation to check the player's requirements, then close the run when they are met.
 
         [Blueprints and inventory targets]
         build_blueprint accepts final placement positions in any order. Specify each desired wall cell as structure=wall. Walls join at orthogonally adjacent walls and form corners automatically. Other structure values are floor and grass_bed.
@@ -537,6 +547,7 @@ struct ChatCompletionsModel: CharacterModel {
         receipt = results (outcomes in order), skipped (count), observation (actual state when the call settled)
         receipt.walks, when present, gives {index, destination: [x,y], steps}; index is zero-based and steps counts cells actually traversed
         say = display nonempty text in game chat
+        Once the goal is met, call act once with say (your completion message) followed by finish in the same actions array. A plain-text reply reaches neither the player nor the engine.
         finish = end the current run
         """
 
@@ -725,7 +736,7 @@ private struct ToolDefinition: Encodable, Sendable {
     static let requestPlan = ToolDefinition(
         .requestPlan, description: "Start a background construction plan and return immediately.",
         properties: [
-            "brief": .init(description: "Describe the desired layout, constraints and relevant player instructions."),
+            "brief": .init(description: "Design intent and style only. The planner chooses the site and coordinates."),
             "include_vision": .init(type: "boolean", description: "Attach the current map image if vision is enabled. Defaults to false."),
         ],
         required: ["brief"]
@@ -831,7 +842,7 @@ enum ModelAPIError: LocalizedError {
     case invalidResponse
     case incompleteStream
     case noToolCall(String?)
-    case textInsteadOfTool
+    case textInsteadOfTool(String)
     case duplicateToolCallID
     case missingToolCallID
     case plannerUnavailable
