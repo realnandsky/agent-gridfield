@@ -5,6 +5,19 @@ struct BlueprintPlacement: Decodable, Sendable {
 
     var position: Position { Position(x: x, y: y) }
 
+    static func bounds(of placements: [BlueprintPlacement]) -> [[Int]]? {
+        guard let first = placements.first else { return nil }
+        var minX = first.x, maxX = first.x
+        var minY = first.y, maxY = first.y
+        for placement in placements.dropFirst() {
+            minX = min(minX, placement.x)
+            maxX = max(maxX, placement.x)
+            minY = min(minY, placement.y)
+            maxY = max(maxY, placement.y)
+        }
+        return [[minX, minY], [maxX, maxY]]
+    }
+
     init(x: Int, y: Int, structure: Structure) {
         self.x = x
         self.y = y
@@ -24,6 +37,13 @@ struct BlueprintPlacement: Decodable, Sendable {
 }
 
 enum BlueprintPlanner {
+    static func layoutFailure(_ placements: [BlueprintPlacement], in world: World) -> PlanFailure? {
+        guard !placements.isEmpty else {
+            return PlanFailure(.invalidArguments, "The blueprint must contain at least one placement.")
+        }
+        return validate(placements, in: world).failure
+    }
+
     static func build(_ placements: [BlueprintPlacement], in plan: inout WorldPlan) -> PlanFailure? {
         guard !placements.isEmpty else {
             return PlanFailure(.invalidArguments, "The blueprint must contain at least one placement.")

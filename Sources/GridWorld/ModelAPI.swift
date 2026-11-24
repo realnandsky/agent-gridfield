@@ -2,6 +2,47 @@ import Foundation
 
 enum CharacterTool: String, Sendable {
     case act, memory, vision
+    case requestPlan = "request_plan"
+}
+
+struct PlanRequest: Decodable, Sendable {
+    let brief: String
+    let includeVision: Bool?
+
+    init(from decoder: any Decoder) throws {
+        let fields = try decoder.container(keyedBy: ToolField.self)
+        let names = Set(fields.allKeys.map(\.stringValue))
+        let brief = try fields.decode(String.self, forKey: ToolField("brief"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard names.isSubset(of: ["brief", "include_vision"]), !brief.isEmpty else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
+                                                    debugDescription: "Expected a nonempty brief and optional include_vision"))
+        }
+        self.brief = brief
+        self.includeVision = try fields.decodeIfPresent(Bool.self, forKey: ToolField("include_vision"))
+    }
+}
+
+struct PlanProposal: Decodable, Sendable {
+    let summary: String
+    let placements: [BlueprintPlacement]
+
+    init(summary: String, placements: [BlueprintPlacement]) {
+        self.summary = summary
+        self.placements = placements
+    }
+
+    init(from decoder: any Decoder) throws {
+        let fields = try decoder.container(keyedBy: ToolField.self)
+        guard Set(fields.allKeys.map(\.stringValue)) == ["summary", "placements"] else {
+            throw ModelAPIError.invalidPlanResponse
+        }
+        let summary = try fields.decode(String.self, forKey: ToolField("summary"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let placements = try fields.decode([BlueprintPlacement].self, forKey: ToolField("placements"))
+        guard !summary.isEmpty, !placements.isEmpty else { throw ModelAPIError.invalidPlanResponse }
+        self.init(summary: summary, placements: placements)
+    }
 }
 
 struct ToolCall: Codable, Equatable, Sendable {
@@ -38,20 +79,31 @@ struct ToolReply: Sendable {
 }
 
 enum ModelTurn: Sendable {
-    case initial(WorldObservation, vision: VisionCall? = nil)
-    case result([ToolReply])
+    case initial(WorldObservation, vision: VisionCall? = nil, context: ModelContext? = nil)
+    case result([ToolReply], context: ModelContext? = nil)
 }
 
 protocol CharacterModel: Sendable {
     var visionEnabled: Bool { get }
     func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall]
+    func plan(brief: String, observation: WorldObservation, vision: VisionCall?, planID: UUID) async throws -> PlanProposal
 }
 
 extension CharacterModel {
     var visionEnabled: Bool { false }
+
+    func plan(brief: String, observation: WorldObservation, vision: VisionCall?, planID: UUID) async throws -> PlanProposal {
+        throw ModelAPIError.plannerUnavailable
+    }
 }
 
 struct ChatCompletionsModel: CharacterModel {
+    private struct ImageAttachment {
+        let messageIndex: Int
+        let vision: VisionCall
+        let frame: VisionFrame
+    }
+
     private let endpoint: URL
     private let model: String
     private let apiKey: String?
@@ -94,6 +146,41 @@ struct ChatCompletionsModel: CharacterModel {
         }
     }
 
+    func plan(brief: String, observation: WorldObservation, vision: VisionCall?, planID: UUID) async throws -> PlanProposal {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let prompt = await debugger?.prompt ?? ""
+        let input = try encoder.jsonString(PlanningTurn(
+            goal: taskGoal, brief: brief, observation: observation, instructions: prompt.isEmpty ? nil : prompt
+        ))
+        var messages = [
+            ChatMessage(role: instructionRole, content: Self.planningRules),
+            ChatMessage(role: "user", content: input),
+        ]
+        var attachments: [ImageAttachment] = []
+        if visionEnabled, let vision, let frame = vision.frame {
+            messages[1].imageURL = "data:image/png;base64," + frame.png.base64EncodedString()
+            attachments.append(ImageAttachment(messageIndex: 1, vision: vision, frame: frame))
+        }
+        let body = ChatRequest(
+            model: model, messages: messages, tools: nil, toolChoice: nil,
+            reasoningEffort: reasoningEffort == "none" ? fastReasoningEffort : reasoningEffort,
+            stream: streaming ? true : nil,
+            toolStream: nil, parallelToolCalls: nil, store: isZhipu ? nil : false,
+            responseFormat: supportsJSONMode ? .jsonObject : nil
+        )
+        let (data, _) = try await send(body, attachments: attachments, brain: .slow, planID: planID)
+        let decoder = JSONDecoder()
+        guard let response = try? decoder.decode(ChatResponse.self, from: data),
+              let choice = response.choices.first,
+              choice.finishReason == "stop", choice.message.toolCalls?.isEmpty != false,
+              let content = choice.message.content,
+              let proposal = try? decoder.decode(PlanProposal.self, from: Data(content.utf8)) else {
+            throw ModelAPIError.invalidPlanResponse
+        }
+        return proposal
+    }
+
     private func decodeCalls(_ data: Data, exchangeID: UUID?) throws -> [ToolCall] {
         guard let response = try? JSONDecoder().decode(ChatResponse.self, from: data),
               let choice = response.choices.first else {
@@ -122,23 +209,27 @@ struct ChatCompletionsModel: CharacterModel {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let prompt = await debugger?.prompt ?? ""
-        let instructionRole = endpoint.host == "api.openai.com" ? "developer" : "system"
         let observation: WorldObservation?
+        let context: ModelContext?
         var images: [(vision: VisionCall, callID: String?)] = []
         var history: [ChatMessage] = []
         switch turn {
-        case .initial(let initialObservation, let openingScan):
+        case .initial(let initialObservation, let openingScan, let modelContext):
             observation = initialObservation
+            context = modelContext
             if let openingScan { images.append((openingScan, nil)) }
-        case .result(let replies):
+        case .result(let replies, let modelContext):
             observation = nil
+            context = modelContext
             history.append(ChatMessage(
                 role: "assistant",
                 toolCalls: replies.map(\.call), reasoningContent: replies.first?.call.reasoningContent
             ))
-            for reply in replies {
+            for (index, reply) in replies.enumerated() {
+                var receipt = reply.receipt
+                if index == replies.count - 1 { receipt.context = modelContext }
                 history.append(ChatMessage(
-                    role: "tool", content: try encoder.jsonString(reply.receipt), toolCallID: reply.call.id
+                    role: "tool", content: try encoder.jsonString(receipt), toolCallID: reply.call.id
                 ))
                 if let vision = reply.vision { images.append((vision, reply.call.id)) }
             }
@@ -148,7 +239,8 @@ struct ChatCompletionsModel: CharacterModel {
             return (image.vision, image.callID, frame)
         }
         let userContent = try encoder.jsonString(PlayerTurn(
-            goal: taskGoal, observation: observation, instructions: prompt.isEmpty ? nil : prompt
+            goal: taskGoal, observation: observation, instructions: prompt.isEmpty ? nil : prompt,
+            context: history.isEmpty ? context : nil
         ))
         let retryReminder = retryingTextResponse
             ? "\nYour previous response used plain text without a tool call. Submit at least one tool call now. Use act's say to speak and act's finish to end the run."
@@ -158,29 +250,36 @@ struct ChatCompletionsModel: CharacterModel {
             ChatMessage(role: instructionRole, content: Self.rules + visionRules + retryReminder),
             ChatMessage(role: "user", content: userContent),
         ] + history
-        var imageMessageIndices: [Int] = []
+        var attachments: [ImageAttachment] = []
         for image in frames {
             let imageURL = "data:image/png;base64," + image.frame.png.base64EncodedString()
             if let callID = image.callID {
                 // Keep all tool receipts together, then identify each attached map by its call ID.
-                imageMessageIndices.append(messages.count)
+                attachments.append(ImageAttachment(messageIndex: messages.count, vision: image.vision, frame: image.frame))
                 messages.append(ChatMessage(
                     role: "user", content: "Agent Gridfield map for vision tool call \(callID).",
                     imageURL: imageURL
                 ))
             } else {
-                imageMessageIndices.append(1)
+                attachments.append(ImageAttachment(messageIndex: 1, vision: image.vision, frame: image.frame))
                 messages[1].imageURL = imageURL
             }
         }
 
-        let isZhipu = ModelSettings.isZhipuHost(endpoint.host)
         let toolStream = streaming && ModelSettings.isGLMFlash(host: endpoint.host, model: model)
         let tools = visionEnabled ? Self.tools + [.vision] : Self.tools
-        var body = ChatRequest(model: model, messages: messages, tools: tools, toolChoice: "auto",
-                               reasoningEffort: reasoningEffort, stream: streaming ? true : nil,
+        let body = ChatRequest(model: model, messages: messages, tools: tools, toolChoice: "auto",
+                               reasoningEffort: fastReasoningEffort, stream: streaming ? true : nil,
                                toolStream: toolStream ? true : nil,
-                               parallelToolCalls: isZhipu ? nil : true, store: isZhipu ? nil : false)
+                               parallelToolCalls: isZhipu ? nil : true, store: isZhipu ? nil : false,
+                               responseFormat: nil)
+        return try await send(body, attachments: attachments, brain: .fast)
+    }
+
+    private func send(_ body: ChatRequest, attachments: [ImageAttachment], brain: APIExchange.Brain,
+                      planID: UUID? = nil) async throws -> (Data, UUID?) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -193,17 +292,19 @@ struct ChatCompletionsModel: CharacterModel {
 
         let exchangeID: UUID?
         if let debugger {
-            for (index, image) in zip(imageMessageIndices, frames) {
-                let frame = image.frame
-                body.messages[index].imageURL = "[PNG \(frame.width)×\(frame.height), \(frame.png.count) bytes]"
+            var debugBody = body
+            for attachment in attachments {
+                let frame = attachment.frame
+                debugBody.messages[attachment.messageIndex].imageURL = "[PNG \(frame.width)×\(frame.height), \(frame.png.count) bytes]"
             }
-            let loggedPayload = frames.isEmpty ? payload : try encoder.encode(body)
+            let loggedPayload = attachments.isEmpty ? payload : try encoder.encode(debugBody)
             let exchange = APIExchange(
                 method: "POST",
                 address: redacted(endpoint.absoluteString),
                 requestHeaders: debugHeaders(request.allHTTPHeaderFields ?? [:]),
-                requestBody: redacted(String(decoding: loggedPayload, as: UTF8.self)), visionID: frames.first?.vision.id,
-                additionalVisionIDs: frames.count > 1 ? frames.dropFirst().map(\.vision.id) : nil
+                requestBody: redacted(String(decoding: loggedPayload, as: UTF8.self)), brain: brain, planID: planID,
+                visionID: attachments.first?.vision.id,
+                additionalVisionIDs: attachments.count > 1 ? attachments.dropFirst().map(\.vision.id) : nil
             )
             try await debugger.record(exchange, apiKey: apiKey)
             exchangeID = exchange.id
@@ -215,19 +316,19 @@ struct ChatCompletionsModel: CharacterModel {
         let response: HTTPURLResponse
         do {
             try Task.checkCancellation()
-            for image in frames { await image.vision.update(.sending) }
+            for attachment in attachments { await attachment.vision.update(.sending) }
             try Task.checkCancellation()
             (data, response) = try await receive(request, exchangeID: exchangeID)
         } catch {
             let cancelled = Task.isCancelled || (error as? URLError)?.code == .cancelled
-            for image in frames { await image.vision.update(cancelled ? .cancelled : .failed) }
+            for attachment in attachments { await attachment.vision.update(cancelled ? .cancelled : .failed) }
             if let debugger, let exchangeID {
                 await debugger.finish(exchangeID, with: cancelled ? .cancelled : .failed(message: redacted(error.localizedDescription)))
             }
             throw error
         }
         let succeeded = (200..<300).contains(response.statusCode)
-        for image in frames { await image.vision.update(succeeded ? .sent : .rejected(response.statusCode)) }
+        for attachment in attachments { await attachment.vision.update(succeeded ? .sent : .rejected(response.statusCode)) }
         if let debugger, let exchangeID {
             await debugger.finish(exchangeID, with: .response(
                 status: response.statusCode,
@@ -305,6 +406,23 @@ struct ChatCompletionsModel: CharacterModel {
         redaction.redact(text)
     }
 
+    private var instructionRole: String { endpoint.host == "api.openai.com" ? "developer" : "system" }
+    private var isZhipu: Bool { ModelSettings.isZhipuHost(endpoint.host) }
+    private var supportsJSONMode: Bool { endpoint.host == "api.openai.com" || endpoint.host == "api.deepseek.com" }
+
+    private var fastReasoningEffort: String? {
+        if ModelSettings.isGLMFlash(host: endpoint.host, model: model) { return "low" }
+        if endpoint.host == "api.openai.com" {
+            let originalGPT5 = ["gpt-5", "gpt-5-mini", "gpt-5-nano"]
+            if originalGPT5.contains(model) || originalGPT5.contains(where: { model == "\($0)-2025-08-07" }) {
+                return "minimal"
+            }
+            if model.hasPrefix("gpt-4") || model.hasPrefix("gpt-3.5") || model.hasPrefix("chatgpt-4o") { return nil }
+            if model.hasPrefix("o3") || model.hasPrefix("o4-mini") { return "low" }
+        }
+        return "none"
+    }
+
     private static let streamingSession = networkSession(resourceTimeout: 30 * 60)
     private static let nonStreamingSession = networkSession(resourceTimeout: 180)
 
@@ -316,7 +434,7 @@ struct ChatCompletionsModel: CharacterModel {
     }
 
     private static let rules = """
-        You control the avatar in Agent Gridfield. The player supplies goal and optional instructions.
+        You are the fast brain and control the avatar in Agent Gridfield. The player supplies goal and optional instructions.
 
         [Observation]
         source = user.observation initially, latest tool receipt.observation thereafter
@@ -329,6 +447,7 @@ struct ChatCompletionsModel: CharacterModel {
         inventory = {item: count}; missing item = 0
         items[] = [x,y,item,count]; loose and attached items are counted together; omitted = []
         block_state = additional block conditions when present
+        Live context is in the opening user message or the last tool receipt. context.worldTick is the current engine tick at 8 Hz and context.wakeReason explains why this decision is requested.
 
         [Memory]
         Each request includes the goal and current world observation. Subsequent requests include the immediately preceding calls, their receipts in call order, and the preceding reasoning when available.
@@ -337,12 +456,14 @@ struct ChatCompletionsModel: CharacterModel {
         Entry IDs are nonblank strings. An ID can appear in either set or remove per call. All changes apply together.
         Notebook text is limited to \(MemoryReceipt.notebookByteLimit) UTF-8 bytes; saved IDs and entry text share a separate \(MemoryReceipt.byteLimit)-byte limit.
         memory({}) returns saved entries and the current observation. recentHistory contains up to four earlier batches of processed actions. History count groups identical adjacent actions.
-        Historical blueprint events include placementCount and inclusive bounds [[minX,minY],[maxX,maxY]].
+        Historical blueprint events include placementCount and inclusive bounds [[minX,minY],[maxX,maxY]]. A successful applied proposal also includes planSummary.
 
         [Actions]
         act accepts a nonempty ordered actions array.
         action          | fields besides action
         build_blueprint | placements (nonempty array of {x,y,structure})
+        apply_plan      | planID (from context.pendingPlan)
+        wait_for_plan   | none
         acquire         | item, count (desired inventory total)
         walk_to         | x, y (integers)
         move            | direction
@@ -355,12 +476,23 @@ struct ChatCompletionsModel: CharacterModel {
         say             | text
         finish          | none
 
+        [Background planning]
+        request_plan accepts a concise brief and optional include_vision (default false, available when vision is enabled).
+        The planner already receives the goal, player instructions, and observation. Keep the brief short and use it for extra design priorities.
+        Request a plan for complex layouts and multi-room designs. If context.planningSuggested is true after repeated failures, prioritize requesting a plan instead of retrying the same intent.
+        When requesting a plan at the start or after player_input, pair request_plan with a short act say in the same response so the player hears from you right away. Save longer notes for later if useful.
+        plan_requested means the planner has started in the background. A new request replaces the previous one.
+        While context.planInProgress is true, you can say something to the player, gather resources, or take other useful short actions. Use wait_for_plan as the last action in its batch only while a plan is in progress.
+        A planner result wakes you if you are waiting. On plan_ready, inspect context.pendingPlan for planID, createdTick, summary, placementCount and bounds. Choose apply_plan if the proposal fits the goal. context.planFailure describes a failed request.
+        Use apply_plan with the supplied planID to build the proposal. The engine consumes the proposal when the action starts and validates every saved placement against the current world. plan_unavailable means the ID is unavailable. You can ignore a proposal or replace it with a new request.
+        A built receipt with appliedPlan confirms that every placement in the saved design is present. Use appliedPlan.summary and the latest observation to check the player's requirements, then finish when they are met.
+
         [Blueprints and inventory targets]
         build_blueprint accepts final placement positions in any order. Specify each desired wall cell as structure=wall. Walls join at orthogonally adjacent walls and form corners automatically. Other structure values are floor and grass_bed.
         The engine clears trees and bushes on the footprint, opens access through trees when necessary, gathers or crafts missing materials, and chooses placement order and reachable stands to avoid trapping the avatar. Multiple buildings can share one blueprint. Choose their layout using the observation.
         A floor and a grass bed can share a tile. Walls require bare ground. Existing matching structures count as placed. Water and conflicting structures block a placement.
         acquire takes a positive count and counts items already carried toward that total. The engine finds reachable resources and uses recipes as needed. Recipe yields can leave extra items.
-        Both actions plan against the current world. The engine executes individual steps on world ticks. Success yields built or acquired. An infeasible plan leaves the world as it was before that action.
+        build_blueprint, apply_plan and acquire plan against the current world. The engine executes individual steps on world ticks. Success yields built or acquired. An infeasible plan leaves the world as it was before that action.
         receipt.plans lists {index, steps, failure?} for plan actions. steps counts executed steps. index is the zero-based action index. failure contains reason and may include position [x,y], item, needed and available.
 
         [Direct actions]
@@ -407,6 +539,16 @@ struct ChatCompletionsModel: CharacterModel {
         finish = end the current run
         """
 
+    private static let planningRules = """
+        Design a construction blueprint for Agent Gridfield using the current observation, player goal and planning brief. An optional map image shows the same observation.
+
+        ground and above are full map layers. The zero-based array index is y. Each row uses space-separated x=ID or start..end=ID ranges with inclusive endpoints. legend maps IDs to block types. [0,0] is the northwest tile, +x is east, and +y is south. avatar is [x,y]. Use absolute coordinates.
+
+        Select final tiles within the map. Water and conflicting existing structures block placement. The engine can clear trees and bushes and gather or craft materials. A wall needs bare ground. A floor and a grass bed can share a tile. Matching existing structures already count as placed. Orthogonally adjacent wall tiles join and form corners automatically. Leave entrances and accessible approaches when the design calls for usable rooms. Use each intended placement once.
+
+        Return exactly one JSON object with two fields. summary is a short descriptive string. placements is a nonempty array of objects containing exactly integer x, integer y and structure, one of wall, floor or grass_bed. Return JSON without Markdown or surrounding text.
+        """
+
     private static let visionRules = """
 
 
@@ -426,25 +568,40 @@ struct ChatCompletionsModel: CharacterModel {
         }.joined(separator: "\n")
     }
 
-    private static let tools: [ToolDefinition] = [.act, .memory]
+    private static let tools: [ToolDefinition] = [.act, .memory, .requestPlan]
 }
 
 private struct PlayerTurn: Encodable {
     let goal: String
     let observation: WorldObservation?
     let instructions: String?
+    let context: ModelContext?
+}
+
+private struct PlanningTurn: Encodable {
+    let goal: String
+    let brief: String
+    let observation: WorldObservation
+    let instructions: String?
 }
 
 private struct ChatRequest: Encodable {
+    struct ResponseFormat: Encodable {
+        let type: String
+
+        static let jsonObject = Self(type: "json_object")
+    }
+
     let model: String
     var messages: [ChatMessage]
-    let tools: [ToolDefinition]
-    let toolChoice: String
+    let tools: [ToolDefinition]?
+    let toolChoice: String?
     let reasoningEffort: String?
     let stream: Bool?
     let toolStream: Bool?
     let parallelToolCalls: Bool?
     let store: Bool?
+    let responseFormat: ResponseFormat?
 
     enum CodingKeys: String, CodingKey {
         case model, messages, tools, store, stream
@@ -452,6 +609,7 @@ private struct ChatRequest: Encodable {
         case toolChoice = "tool_choice"
         case toolStream = "tool_stream"
         case parallelToolCalls = "parallel_tool_calls"
+        case responseFormat = "response_format"
     }
 }
 
@@ -563,6 +721,14 @@ private struct ToolDefinition: Encodable, Sendable {
             + "The image arrives on your next turn. Coordinates match those used by act.",
         properties: [:]
     )
+    static let requestPlan = ToolDefinition(
+        .requestPlan, description: "Start a background construction plan and return immediately.",
+        properties: [
+            "brief": .init(description: "Describe the desired layout, constraints and relevant player instructions."),
+            "include_vision": .init(type: "boolean", description: "Attach the current map image if vision is enabled. Defaults to false."),
+        ],
+        required: ["brief"]
+    )
 
     private static let stand = Parameter(type: "array", items: .init(type: "integer"),
                                          description: "Exact [x,y] tile orthogonally adjacent to the target.",
@@ -579,6 +745,7 @@ private struct ToolDefinition: Encodable, Sendable {
         "stand": stand,
         "count": .init(type: "integer", description: "Required desired inventory total for acquire. For craft and item collection, quantity to process, defaulting to 1.", minimum: 1),
         "text": .init(),
+        "planID": .init(description: "Required for apply_plan. Copy the ID from context.pendingPlan."),
         "placements": .init(type: "array", items: placement,
                             description: "Required for build_blueprint. Final tiles in any order.", minItems: 1),
     ], required: ["action"], additionalProperties: false)
@@ -666,6 +833,8 @@ enum ModelAPIError: LocalizedError {
     case textInsteadOfTool
     case duplicateToolCallID
     case missingToolCallID
+    case plannerUnavailable
+    case invalidPlanResponse
 
     var errorDescription: String? {
         switch self {
@@ -691,6 +860,10 @@ enum ModelAPIError: LocalizedError {
             "The model reused a tool call ID in one response. See Developer Tools for details."
         case .missingToolCallID:
             "The tool call is missing an ID. See Developer Tools for the response."
+        case .plannerUnavailable:
+            "Background planning is unavailable for this model."
+        case .invalidPlanResponse:
+            "The planner did not return a valid blueprint. See Developer Tools for the response."
         }
     }
 }

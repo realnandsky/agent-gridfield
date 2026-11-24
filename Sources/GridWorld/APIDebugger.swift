@@ -2,6 +2,10 @@ import Foundation
 import Observation
 
 struct APIExchange: Identifiable, Encodable, Sendable {
+    enum Brain: String, Encodable, Sendable {
+        case fast, slow
+    }
+
     enum Outcome: Encodable, Sendable {
         case waiting
         case receiving(status: Int, phase: String, preview: String)
@@ -33,6 +37,8 @@ struct APIExchange: Identifiable, Encodable, Sendable {
     let address: String
     let requestHeaders: String
     let requestBody: String
+    var brain: Brain = .fast
+    var planID: UUID? = nil
     var visionID: UUID? = nil
     var additionalVisionIDs: [UUID]? = nil
     var outcome: Outcome = .waiting

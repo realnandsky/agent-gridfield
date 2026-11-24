@@ -1,6 +1,23 @@
 import Foundation
 import Observation
 
+struct PlanSummary: Encodable, Sendable {
+    let planID: UUID
+    let createdTick: UInt64
+    let summary: String
+    let placementCount: Int
+    let bounds: [[Int]]
+}
+
+struct ModelContext: Encodable, Sendable {
+    let worldTick: UInt64
+    let wakeReason: GameSession.WakeReason
+    let planInProgress: Bool
+    let pendingPlan: PlanSummary?
+    let planFailure: String?
+    let planningSuggested: Bool?
+}
+
 struct CharacterMessage: Identifiable, Encodable {
     let id = UUID()
     let sender: String
@@ -25,6 +42,7 @@ struct ToolActivity: Identifiable {
             case .act: summary = receipt.results.count == 1 ? "1 action" : "\(receipt.results.count) actions"
             case .vision: summary = "Frame captured"
             case .memory: summary = receipt.memory?.update == .applied ? "Memory updated" : "Unchanged"
+            case .requestPlan: summary = "Plan requested"
             case nil: summary = "Unknown tool"
             }
         }
@@ -43,6 +61,8 @@ final class GameSession {
         var execution: IntentExecution
         var history: [HistoryEvent] = []
         var planning: Task<Void, Never>?
+        var applyingPlan: PlanSummary?
+        var appliedPlan: PlanSummary?
 
         init(call: ToolCall, activityIndex: Int, continuation: CheckedContinuation<ToolReply, any Error>) {
             self.call = call
@@ -50,6 +70,22 @@ final class GameSession {
             self.continuation = continuation
             execution = IntentExecution(actions: (try? call.decodeBatch().actions) ?? [])
         }
+    }
+
+    private struct PlannerWork {
+        let id: UUID
+        let task: Task<Void, Never>
+        let vision: VisionCall?
+    }
+
+    private struct FastDecision {
+        let task: Task<Void, Never>
+        let replies: AsyncStream<Result<[ToolCall], any Error>>.Continuation
+    }
+
+    private struct SavedPlan {
+        let summary: PlanSummary
+        let placements: [BlueprintPlacement]
     }
 
     struct DebugInputs: Encodable, Equatable {
@@ -66,11 +102,13 @@ final class GameSession {
         case idle
         case awaitingModel = "awaiting_model"
         case executingIntent = "executing_intent"
+        case waitingForPlan = "waiting_for_plan"
     }
 
-    private enum WakeReason: String, Encodable {
+    enum WakeReason: String, Encodable, Sendable {
         case start, toolResults = "tool_results"
         case intentFailed = "intent_failed", intentInterrupted = "intent_interrupted"
+        case planReady = "plan_ready", planFailed = "plan_failed", playerInput = "player_input"
     }
 
     private struct ModelWake: Encodable {
@@ -141,13 +179,16 @@ final class GameSession {
             let attached: [String: Int]
         }
 
-        let schemaVersion = 4
+        let schemaVersion = 5
         let timestamp = Date()
         let processID = ProcessInfo.processInfo.processIdentifier
         let runID: UUID?
         let phase: RunPhase
         let isRunning: Bool
         let worldTick: UInt64
+        let planInProgress: Bool
+        let pendingPlan: PlanSummary?
+        let planFailure: String?
         let inputs: DebugInputs?
         let batch: BatchProgress?
         let observation: WorldObservation
@@ -168,6 +209,8 @@ final class GameSession {
     @ObservationIgnored private var recentHistory = RecentHistory()
     private(set) var isRunning = false
     private(set) var hasActiveIntent = false
+    private(set) var isPlanning = false
+    var canInterruptIntent: Bool { hasActiveIntent || isPlanning || pendingPlan != nil }
     @ObservationIgnored private(set) var worldTick: UInt64 = 0
     var issue: String? {
         didSet {
@@ -189,6 +232,14 @@ final class GameSession {
     @ObservationIgnored private var runID: UUID?
     @ObservationIgnored private(set) var task: Task<Void, Never>?
     @ObservationIgnored private var clockTask: Task<Void, Never>?
+    @ObservationIgnored private var fastDecision: FastDecision?
+    @ObservationIgnored private var planner: PlannerWork?
+    private var pendingPlan: SavedPlan?
+    @ObservationIgnored private var planFailure: String?
+    @ObservationIgnored private var plannerWake: WakeReason?
+    @ObservationIgnored private var controlWake: WakeReason?
+    @ObservationIgnored private var plannerWaiter: CheckedContinuation<Void, Never>?
+    @ObservationIgnored private var consecutiveIntentFailures = 0
 
     init(tickInterval: Duration? = nil, debugExport: DebugExport? = nil) {
         self.tickInterval = max(.milliseconds(1), tickInterval ?? .seconds(1) / Self.ticksPerSecond)
@@ -231,8 +282,21 @@ final class GameSession {
     }
 
     func interruptIntent() {
+        guard canInterruptIntent else { return }
+        steer(reason: .intentInterrupted, eventReason: "player_interrupted")
+    }
+
+    func playerInstructionsChanged() {
+        steer(reason: .playerInput, eventReason: "player_input")
+    }
+
+    private func steer(reason: WakeReason, eventReason: String) {
         guard let runID else { return }
-        interruptActiveIntent(run: runID, reason: "player_interrupted")
+        controlWake = reason
+        clearPlanning(run: runID, reason: eventReason)
+        interruptActiveIntent(run: runID, reason: eventReason)
+        cancelDecision()
+        exportState()
     }
 
     func reset() {
@@ -253,15 +317,19 @@ final class GameSession {
     private func endRun(reason: String) {
         guard let runID else { return }
         let endingBatch = batchProgress
+        clearPlanning(run: runID, reason: reason)
         interruptActiveIntent(run: runID, reason: reason)
         debugExport?.event("run_ended", RunEnd(runID: runID, reason: reason, batch: endingBatch))
         self.runID = nil
         isRunning = false
         task?.cancel()
         task = nil
+        cancelDecision()
         clockTask?.cancel()
         clockTask = nil
         batchProgress = nil
+        controlWake = nil
+        consecutiveIntentFailures = 0
         phase = .idle
         exportState()
         debugExport?.closeRun()
@@ -304,13 +372,36 @@ final class GameSession {
                 pendingVision.append(recordVision(frame: frame, status: frame == nil ? .renderFailed : .pending))
                 exportState()
             }
-            var turn = ModelTurn.initial(world.observation(notebook: notebook), vision: pendingVision.first)
+            var previousReplies: [ToolReply]?
             var wake = WakeReason.start
             while true {
                 try checkRun(id)
+                wake = controlWake ?? plannerWake ?? wake
+                controlWake = nil
+                plannerWake = nil
+                phase = .awaitingModel
+                let context = ModelContext(
+                    worldTick: worldTick, wakeReason: wake, planInProgress: isPlanning,
+                    pendingPlan: pendingPlan?.summary, planFailure: planFailure,
+                    planningSuggested: planningSuggested
+                )
+                let turn = previousReplies.map { ModelTurn.result($0, context: context) }
+                    ?? .initial(world.observation(notebook: notebook), vision: pendingVision.first, context: context)
                 debugExport?.event("model_woken", ModelWake(runID: id, tick: worldTick, reason: wake))
-                let calls = try await Self.chooseTools(turn, using: model)
+                exportState()
+                let response = await nextDecision(turn, using: model)
                 try checkRun(id)
+                fastDecision = nil
+                if controlWake != nil {
+                    for vision in pendingVision { vision.update(.cancelled) }
+                    pendingVision.removeAll()
+                    previousReplies = previousReplies?.map { reply in
+                        ToolReply(call: reply.call, receipt: reply.receipt)
+                    }
+                    continue
+                }
+                guard let response else { throw CancellationError() }
+                let calls = try response.get()
                 pendingVision.removeAll()
 
                 var replies: [ToolReply] = []
@@ -327,20 +418,24 @@ final class GameSession {
                         reply = try await executeIntent(call, activityIndex: activityIndex, run: id)
                         try checkRun(id)
                         if reply.receipt.finished { return }
-                        if reply.receipt.results.contains(.interrupted) {
+                        if controlWake != nil || reply.receipt.results.contains(.interrupted) {
                             wake = .intentInterrupted
                         } else if reply.receipt.results.contains(where: { !$0.success }) {
                             wake = .intentFailed
                         }
                     } else {
-                        reply = handleTool(call, visionEnabled: model.visionEnabled, run: id)
+                        reply = handleTool(call, model: model, run: id)
                         toolActivity[activityIndex].finish(reply.receipt)
                         if let vision = reply.vision { pendingVision.append(vision) }
                         exportState()
                     }
                     replies.append(reply)
                 }
-                turn = .result(replies)
+                previousReplies = replies
+                if controlWake == nil, wake == .toolResults,
+                   replies.contains(where: { $0.receipt.results.contains(.waitingForPlan) }) {
+                    await waitForPlanner()
+                }
             }
         } catch {
             for vision in pendingVision { vision.update(Task.isCancelled ? .cancelled : .failed) }
@@ -349,6 +444,49 @@ final class GameSession {
                 issue = error.localizedDescription
             }
         }
+    }
+
+    private var planningSuggested: Bool? {
+        consecutiveIntentFailures >= 3 ? true : nil
+    }
+
+    private func nextDecision(_ turn: ModelTurn, using model: any CharacterModel) async -> Result<[ToolCall], any Error>? {
+        let (stream, replies) = AsyncStream<Result<[ToolCall], any Error>>.makeStream()
+        let task = Task {
+            do {
+                replies.yield(.success(try await Self.chooseTools(turn, using: model)))
+            } catch {
+                replies.yield(.failure(error))
+            }
+            replies.finish()
+        }
+        fastDecision = FastDecision(task: task, replies: replies)
+        var iterator = stream.makeAsyncIterator()
+        return await iterator.next()
+    }
+
+    private func cancelDecision() {
+        fastDecision?.task.cancel()
+        fastDecision?.replies.finish()
+        fastDecision = nil
+    }
+
+    private func waitForPlanner() async {
+        await withCheckedContinuation { continuation in
+            guard isPlanning, controlWake == nil, !Task.isCancelled else {
+                continuation.resume()
+                return
+            }
+            plannerWaiter = continuation
+            phase = .waitingForPlan
+            exportState()
+        }
+    }
+
+    private func signalPlanner() {
+        let waiter = plannerWaiter
+        plannerWaiter = nil
+        waiter?.resume()
     }
 
     private nonisolated static func chooseTools(
@@ -392,11 +530,12 @@ final class GameSession {
         return .applied
     }
 
-    private func handleTool(_ call: ToolCall, visionEnabled: Bool, run id: UUID) -> ToolReply {
+    private func handleTool(_ call: ToolCall, model: any CharacterModel, run id: UUID) -> ToolReply {
         let history = recentHistory.batches.isEmpty ? nil : recentHistory.batches
         var results: [ActionOutcome] = []
         var update: MemoryReceipt.Update?
         var vision: VisionCall?
+        var requestedPlanID: UUID?
         switch call.tool {
         case .memory:
             let status = applyMemory(call)
@@ -413,7 +552,7 @@ final class GameSession {
                 frame = nil
                 status = .invalid
                 results = [.invalidArguments]
-            } else if !visionEnabled {
+            } else if !model.visionEnabled {
                 frame = nil
                 status = .disabled
                 results = [.visionUnavailable]
@@ -423,16 +562,102 @@ final class GameSession {
                 results = frame == nil ? [.visionUnavailable] : [.inspected]
             }
             vision = recordVision(frame: frame, status: status, call: call)
+        case .requestPlan:
+            if let request = try? call.decode(PlanRequest.self) {
+                requestedPlanID = startPlanner(request, call: call, using: model, run: id)
+                results = [.planRequested]
+            } else {
+                results = [.invalidArguments]
+            }
         case .act, nil:
             results = [.unknownTool]
         }
         let receipt = ToolReceipt(
             results: results, skipped: 0, observation: world.observation(notebook: notebook),
             memory: MemoryReceipt(entries: memoryEntries, update: update),
-            recentHistory: history
+            recentHistory: history, requestedPlanID: requestedPlanID
         )
         recordTool(call, receipt: receipt, run: id)
         return ToolReply(call: call, receipt: receipt, vision: vision)
+    }
+
+    private func startPlanner(_ request: PlanRequest, call: ToolCall, using model: any CharacterModel,
+                              run id: UUID) -> UUID {
+        clearPlanning(run: id, reason: "superseded")
+        consecutiveIntentFailures = 0
+        let planID = UUID()
+        let snapshot = world
+        let observation = snapshot.observation(notebook: notebook)
+        let vision: VisionCall?
+        if request.includeVision == true, model.visionEnabled {
+            let frame = WorldMap(world: snapshot).visionFrame()
+            vision = recordVision(frame: frame, status: frame == nil ? .renderFailed : .pending, call: call)
+        } else {
+            vision = nil
+        }
+        debugExport?.planner(.started, runID: id, planID: planID, tick: worldTick, sourceCall: call)
+        let task = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                let proposal = try await model.plan(brief: request.brief, observation: observation,
+                                                    vision: vision, planID: planID)
+                try Task.checkCancellation()
+                self?.completePlanner(.success(proposal), planID: planID, run: id)
+            } catch {
+                if !Task.isCancelled {
+                    vision?.update(.failed)
+                    self?.completePlanner(.failure(error), planID: planID, run: id)
+                }
+            }
+        }
+        planner = PlannerWork(id: planID, task: task, vision: vision)
+        isPlanning = true
+        return planID
+    }
+
+    private func completePlanner(_ result: Result<PlanProposal, any Error>, planID: UUID, run id: UUID) {
+        guard runID == id, planner?.id == planID else { return }
+        planner = nil
+        isPlanning = false
+        switch result {
+        case .success(let proposal):
+            if let failure = BlueprintPlanner.layoutFailure(proposal.placements, in: world) {
+                let position = failure.position.map { " [\($0[0]),\($0[1])]" } ?? ""
+                failPlanner(failure.reason + position, planID: planID, run: id)
+            } else if let bounds = BlueprintPlacement.bounds(of: proposal.placements) {
+                let summary = PlanSummary(planID: planID, createdTick: worldTick, summary: proposal.summary,
+                                          placementCount: proposal.placements.count, bounds: bounds)
+                pendingPlan = SavedPlan(summary: summary, placements: proposal.placements)
+                plannerWake = .planReady
+                debugExport?.planner(.completed, runID: id, planID: planID, tick: worldTick,
+                                     outcome: "ready", placementCount: summary.placementCount)
+            }
+        case .failure(let error):
+            failPlanner(error.localizedDescription, planID: planID, run: id)
+        }
+        signalPlanner()
+        exportState()
+    }
+
+    private func failPlanner(_ reason: String, planID: UUID, run id: UUID) {
+        planFailure = reason
+        plannerWake = .planFailed
+        debugExport?.planner(.completed, runID: id, planID: planID, tick: worldTick,
+                             outcome: "failed", reason: reason)
+    }
+
+    private func clearPlanning(run id: UUID, reason: String) {
+        if let planner {
+            planner.task.cancel()
+            planner.vision?.update(.cancelled)
+            debugExport?.planner(.cancelled, runID: id, planID: planner.id, tick: worldTick, reason: reason)
+        }
+        planner = nil
+        isPlanning = false
+        pendingPlan = nil
+        planFailure = nil
+        plannerWake = nil
+        signalPlanner()
     }
 
     private func recordTool(_ call: ToolCall, receipt: ToolReceipt, run id: UUID) {
@@ -473,6 +698,12 @@ final class GameSession {
             return
         }
 
+        if let planID = intent.execution.requestedPlanID, let pendingPlan, pendingPlan.summary.planID == planID {
+            intent.execution.useProposal(pendingPlan.placements)
+            intent.applyingPlan = pendingPlan.summary
+            self.pendingPlan = nil
+            plannerWake = nil
+        }
         if let preparation = intent.execution.preparation(in: world) {
             if preparation.isExpensive {
                 let intentID = intent.id
@@ -488,7 +719,8 @@ final class GameSession {
         }
 
         var liveWorld = world
-        guard let update = intent.execution.advance(world: &liveWorld) else { return }
+        let canWait = isPlanning || plannerWake != nil
+        guard let update = intent.execution.advance(world: &liveWorld, canWaitForPlan: canWait) else { return }
         if world != liveWorld { world = liveWorld }
         recordProgress(update, for: intent, run: id)
         if intent.execution.isComplete {
@@ -523,8 +755,15 @@ final class GameSession {
         case .world, nil:
             break
         }
-        if let history = update.history { intent.history.append(history) }
+        if var history = update.history {
+            if let plan = intent.applyingPlan, update.outcome == .built {
+                history.planSummary = plan.summary
+                intent.appliedPlan = plan
+            }
+            intent.history.append(history)
+        }
         if let outcome = update.outcome {
+            intent.applyingPlan = nil
             batchProgress?.processed = intent.execution.results.count
             debugExport?.event("action_processed", ActionEvent(runID: id, toolCallID: intent.call.id, index: update.index,
                                result: outcome, tick: worldTick))
@@ -533,11 +772,20 @@ final class GameSession {
 
     private func finishIntent(_ intent: ActiveIntent, run id: UUID, reason: String) {
         intent.planning?.cancel()
-        let receipt = intent.execution.receipt(
+        var receipt = intent.execution.receipt(
             observation: world.observation(notebook: notebook),
             memory: MemoryReceipt(entries: memoryEntries, update: nil),
             recentHistory: recentHistory.batches.isEmpty ? nil : recentHistory.batches
         )
+        receipt.appliedPlan = intent.appliedPlan
+        if !receipt.results.contains(.interrupted) {
+            if receipt.results.contains(where: { !$0.success }) {
+                consecutiveIntentFailures = min(3, consecutiveIntentFailures + 1)
+            } else if !receipt.results.contains(.waitingForPlan) {
+                consecutiveIntentFailures = 0
+            }
+        }
+        receipt.planningSuggested = planningSuggested
         recentHistory.append(intent.history)
         toolActivity[intent.activityIndex].finish(receipt)
         if var progress = batchProgress {
@@ -564,7 +812,8 @@ final class GameSession {
             }
         }
         debugExport.snapshot(DebugSnapshot(runID: runID, phase: phase, isRunning: isRunning,
-                            worldTick: worldTick, inputs: debugInputs, batch: batchProgress, observation: observation,
+                            worldTick: worldTick, planInProgress: isPlanning, pendingPlan: pendingPlan?.summary,
+                            planFailure: planFailure, inputs: debugInputs, batch: batchProgress, observation: observation,
                             tileItems: tileItems, messages: messages, visionCallCount: visionCalls.count, issue: issue,
                             memoryEntries: memoryEntries, recentHistory: recentHistory.batches))
     }

@@ -112,7 +112,7 @@ struct APIDebugView: View {
                 .border(Color(nsColor: .separatorColor))
                 .accessibilityLabel("Additional instructions")
             HStack {
-                Text("Applies to the next request")
+                Text(session.isRunning ? "Wakes the agent now" : "Applies on the next run")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -188,6 +188,7 @@ struct APIDebugView: View {
     private func applyPrompt() {
         draft = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         debugger.prompt = draft
+        session.playerInstructionsChanged()
     }
 
     private func openVision(_ id: UUID?) {

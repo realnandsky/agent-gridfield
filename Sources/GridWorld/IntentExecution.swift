@@ -50,7 +50,7 @@ struct IntentExecution {
                     return prepared(failure.outcome, failure: failure)
                 }
                 return prepared(.built, primitives: plan.actions)
-            case .world, .say, .invalid:
+            case .world, .say, .applyPlan, .waitForPlan, .invalid:
                 return prepared(.invalidArguments)
             }
         }
@@ -126,7 +126,7 @@ struct IntentExecution {
         }
     }
 
-    private let actions: [CharacterAction]
+    private var actions: [CharacterAction]
     private let malformed: Bool
     private(set) var results: [ActionOutcome] = []
     private var walks: [ToolReceipt.Walk] = []
@@ -143,16 +143,28 @@ struct IntentExecution {
     var actionCount: Int { actions.count }
     var skipped: Int { isComplete ? actions.count - results.count : 0 }
     var isComplete: Bool {
-        results.count == actions.count || results.last.map { !$0.success || $0 == .finished } == true
+        results.count == actions.count || results.last.map {
+            !$0.success || $0 == .finished || $0 == .waitingForPlan
+        } == true
     }
     var currentActionIndex: Int? { isComplete ? nil : results.count }
+
+    var requestedPlanID: UUID? {
+        guard let index = currentActionIndex, case .applyPlan(let planID) = actions[index] else { return nil }
+        return planID
+    }
+
+    mutating func useProposal(_ placements: [BlueprintPlacement]) {
+        guard let index = currentActionIndex, case .applyPlan = actions[index] else { return }
+        actions[index] = .buildBlueprint(placements)
+    }
 
     func preparation(in world: World) -> Preparation? {
         guard prepared == nil, let index = currentActionIndex else { return nil }
         switch actions[index] {
         case .walkTo, .collectAt, .placeAt, .acquire, .buildBlueprint:
             return Preparation(index: index, action: actions[index], world: world)
-        case .world, .say, .invalid:
+        case .world, .say, .applyPlan, .waitForPlan, .invalid:
             return nil
         }
     }
@@ -162,7 +174,7 @@ struct IntentExecution {
         self.prepared = prepared
     }
 
-    mutating func advance(world: inout World) -> Update? {
+    mutating func advance(world: inout World, canWaitForPlan: Bool = false) -> Update? {
         guard let index = currentActionIndex else { return nil }
         let action = actions[index]
         switch action {
@@ -175,6 +187,10 @@ struct IntentExecution {
             return complete(index, .messageSent, origin: world.avatar, step: .message(message))
         case .invalid:
             return complete(index, .invalidArguments, origin: world.avatar)
+        case .applyPlan:
+            return complete(index, .planUnavailable, origin: world.avatar)
+        case .waitForPlan:
+            return complete(index, canWaitForPlan ? .waitingForPlan : .planUnavailable, origin: world.avatar)
         case .walkTo, .collectAt, .placeAt, .acquire, .buildBlueprint:
             guard let prepared else { return nil }
             guard stepsExecuted < prepared.steps.count else {

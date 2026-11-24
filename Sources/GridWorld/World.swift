@@ -125,6 +125,9 @@ enum ActionOutcome: String, Codable, Sendable {
     case crafted, placed, acquired, built
     case messageSent = "message_sent"
     case memoryUpdated = "memory_updated"
+    case planRequested = "plan_requested"
+    case planUnavailable = "plan_unavailable"
+    case waitingForPlan = "waiting_for_plan"
     case visionUnavailable = "vision_unavailable"
     case waterBlocked = "water_blocked", treeBlocked = "tree_blocked"
     case boundary, blockUnavailable = "block_unavailable", itemAbsent = "item_absent"
@@ -136,10 +139,10 @@ enum ActionOutcome: String, Codable, Sendable {
     var success: Bool {
         switch self {
         case .moved, .arrived, .collected, .dropped, .crafted, .placed, .acquired, .built,
-             .messageSent, .memoryUpdated, .finished, .inspected: true
+             .messageSent, .memoryUpdated, .finished, .inspected, .planRequested, .waitingForPlan: true
         case .boundary, .waterBlocked, .treeBlocked, .blockUnavailable, .itemAbsent, .itemNotCarried,
              .invalidArguments, .unknownTool, .visionUnavailable, .wallBlocked, .buildBlocked, .occupied, .missingIngredients,
-             .unreachable, .interrupted: false
+             .unreachable, .interrupted, .planUnavailable: false
         }
     }
 }

@@ -40,6 +40,7 @@ struct HistoryEvent: Encodable, Sendable {
     var avatar: [Int]? = nil
     var placementCount: Int? = nil
     var bounds: [[Int]]? = nil
+    var planSummary: String? = nil
 
     init?(action: CharacterAction, result: ActionOutcome, from avatar: Position) {
         let description: String
@@ -68,23 +69,17 @@ struct HistoryEvent: Encodable, Sendable {
             description = "acquire \(count) \(item.rawValue)"
         case .buildBlueprint:
             description = "build_blueprint"
+        case .applyPlan:
+            description = "apply_plan"
         case .invalid:
             description = "invalid action"
-        case .say, .world(.finish):
+        case .say, .waitForPlan, .world(.finish):
             return nil
         }
         self.init(action: description, result: result, from: avatar)
-        if case .buildBlueprint(let placements) = action, let first = placements.first {
+        if case .buildBlueprint(let placements) = action {
             placementCount = placements.count
-            var minX = first.x, maxX = first.x
-            var minY = first.y, maxY = first.y
-            for placement in placements.dropFirst() {
-                minX = min(minX, placement.x)
-                maxX = max(maxX, placement.x)
-                minY = min(minY, placement.y)
-                maxY = max(maxY, placement.y)
-            }
-            bounds = [[minX, minY], [maxX, maxY]]
+            bounds = BlueprintPlacement.bounds(of: placements)
         }
     }
 

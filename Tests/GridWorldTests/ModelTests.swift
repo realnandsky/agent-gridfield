@@ -552,7 +552,7 @@ func visionSendsEachPNGOnceAndKeepsTheSameImageInHistory() async throws {
         let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         let tools = try #require(json["tools"] as? [[String: Any]])
         #expect(tools.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
-                == ["act", "memory", "vision"])
+                == ["act", "memory", "request_plan", "vision"])
         return try #require(json["messages"] as? [[String: Any]])
     }
     #expect(bodies.map(\.count) == [2, 5, 4, 4, 5, 4])
@@ -622,6 +622,8 @@ func multipleToolCallsRunInOrderAndReturnOneReceiptPerCall() async throws {
     let messages = try #require(body["messages"] as? [[String: Any]])
     #expect(messages.compactMap { $0["role"] as? String } ==
             ["system", "user", "assistant"] + Array(repeating: "tool", count: 6) + ["user", "user"])
+    let user = try decode(WirePlayerTurn.self, messages[1]["content"] as? String)
+    #expect(user.context == nil)
     let assistant = try #require(messages.first { $0["role"] as? String == "assistant" })
     let calls = try #require(assistant["tool_calls"] as? [[String: Any]])
     let expectedIDs = ["plan", "before", "step", "after", "inspect", "speak"]
@@ -633,6 +635,10 @@ func multipleToolCallsRunInOrderAndReturnOneReceiptPerCall() async throws {
     #expect(decoded.map { $0.observation.avatar } == [[8, 5], [8, 5], [9, 5], [9, 5], [9, 5], [9, 5]])
     #expect(decoded.allSatisfy { $0.observation.notebook == "Remember the route" })
     #expect(decoded.map(\.results) == [[.memoryUpdated], [.inspected], [.moved], [.inspected], [.inspected], [.messageSent]])
+    #expect(decoded.dropLast().allSatisfy { $0.context == nil })
+    let context = try #require(decoded.last?.context)
+    #expect(context.wakeReason == "tool_results")
+    #expect(context.worldTick > 0)
     let attachments = messages.suffix(2).compactMap { $0["content"] as? [[String: Any]] }
     try #require(attachments.count == 2)
     #expect((attachments[0].first?["text"] as? String)?.contains("before") == true)
@@ -690,11 +696,13 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
         requests.append(try JSONDecoder().decode(RecordedBody.self, from: data))
     }
     #expect(requests.allSatisfy { $0.parallelToolCalls && !$0.store && $0.model == "test-model" })
-    #expect(requests.allSatisfy { $0.tools.map(\.function.name) == ["act", "memory"] })
+    #expect(requests.allSatisfy { $0.tools.map(\.function.name) == ["act", "memory", "request_plan"] })
     #expect(requests[0].messages.map(\.role) == ["system", "user"])
     let firstTurn = try decode(WirePlayerTurn.self, requests[0].messages[1].content)
     let firstView = try #require(firstTurn.observation)
     #expect(firstTurn.goal == goal)
+    #expect(firstTurn.context?.wakeReason == "start")
+    #expect(firstTurn.context?.planInProgress == false)
     #expect(firstView.ground.count == 12)
     #expect(firstView.above.count == 12)
     #expect((firstView.ground + firstView.above).allSatisfy { expandMapRow($0).count == 17 })
@@ -716,7 +724,11 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(properties["count"]?.type == "integer")
     #expect(schemas[0].properties?.keys.sorted() == ["actions"])
     #expect(schemas[1].properties?.keys.sorted() == ["remove", "set", "text"])
+    #expect(schemas[2].required == ["brief"])
+    #expect(schemas[2].properties?["include_vision"]?.type == "boolean")
     #expect(properties["action"]?.choices?.contains("build_blueprint") == true)
+    #expect(properties["action"]?.choices?.contains("apply_plan") == true)
+    #expect(properties["planID"]?.type == "string")
     #expect(properties["action"]?.choices?.contains("acquire") == true)
     #expect(properties["count"]?.minimum == 1)
     let placements = try #require(properties["placements"])
@@ -925,7 +937,7 @@ func streamedReasoningAndActionsAreAssembledAndIncompleteStreamIsRejected() asyn
     let completed = try #require(debugger.exchanges.last)
     let request = try #require(JSONSerialization.jsonObject(with: Data(completed.requestBody.utf8)) as? [String: Any])
     #expect(request["stream"] as? Bool == true)
-    #expect(request["reasoning_effort"] as? String == "low")
+    #expect(request["reasoning_effort"] as? String == "none")
     if case let .response(status, _, body) = completed.outcome {
         #expect(status == 200)
         #expect(body.contains("reasoning_tokens"))
@@ -950,6 +962,60 @@ func streamedReasoningAndActionsAreAssembledAndIncompleteStreamIsRejected() asyn
         (($0["response"] as? [String: Any])?["body"] as? String)?.contains("reasoning_tokens") == true
     })
     #expect(updates.last?["failed"] != nil)
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
+func plannerUsesSelectedEffortAndAcceptsOnlyStructuredBlueprints() async throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StubChatEndpoint.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let debugger = APIDebugger()
+    let world = World()
+    let vision = VisionCall(number: 1, avatar: world.avatar,
+                            frame: VisionFrame(png: Data([137, 80, 78, 71]), width: 17, height: 12),
+                            status: .pending, openingScan: false)
+    let planID = UUID()
+    let endpoint = try #require(URL(string: "https://api.deepseek.com/plan-test"))
+    let model = ChatCompletionsModel(endpoint: endpoint, model: "deepseek-flash", apiKey: nil,
+                                     taskGoal: "Build a room", reasoningEffort: "low", streaming: false,
+                                     visionEnabled: true, session: session, debugger: debugger)
+    let proposal = try await model.plan(brief: "Keep the east entrance open", observation: world.observation(),
+                                        vision: vision, planID: planID)
+
+    #expect(proposal.summary == "Room with an east entrance")
+    #expect(proposal.placements.count == 1)
+    #expect(proposal.placements.first?.position == Position(x: 9, y: 5))
+    #expect(proposal.placements.first?.structure == .wall)
+    #expect(vision.status == .sent)
+    let exchange = try #require(debugger.exchanges.first)
+    #expect(exchange.brain == .slow)
+    #expect(exchange.planID == planID)
+    #expect(exchange.visionID == vision.id)
+    let body = try #require(JSONSerialization.jsonObject(with: Data(exchange.requestBody.utf8)) as? [String: Any])
+    #expect(body["reasoning_effort"] as? String == "low")
+    #expect((body["response_format"] as? [String: String])?["type"] == "json_object")
+    #expect(body["tools"] == nil)
+    #expect(body["tool_choice"] == nil)
+    let messages = try #require(body["messages"] as? [[String: Any]])
+    #expect(messages.compactMap { $0["role"] as? String } == ["system", "user"])
+    let parts = try #require(messages.last?["content"] as? [[String: Any]])
+    let input = try #require(parts.first?["text"] as? String)
+    #expect(input.contains("Keep the east entrance open"))
+    #expect(input.contains("\"observation\""))
+    #expect((parts.last?["image_url"] as? [String: String])?["url"] == "[PNG 17×12, 4 bytes]")
+
+    for path in ["act", "extra-field"] {
+        let invalid = ChatCompletionsModel(endpoint: endpoint.appendingPathComponent(path), model: "deepseek-flash",
+                                           apiKey: nil, taskGoal: "Build a room", streaming: false, session: session)
+        do {
+            _ = try await invalid.plan(brief: "Keep the east entrance open", observation: world.observation(),
+                                       vision: nil, planID: UUID())
+            Issue.record("Expected the planner to reject \(path)")
+        } catch ModelAPIError.invalidPlanResponse {
+        }
+    }
 }
 
 private struct DebugTraceFiles {
@@ -1026,7 +1092,7 @@ private actor ScriptedTools: CharacterModel {
     }
 
     func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
-        if case .result(let results) = turn { replies.append(contentsOf: results) }
+        if case .result(let results, _) = turn { replies.append(contentsOf: results) }
         guard calls.indices.contains(index) else { throw ModelAPIError.noToolCall(nil) }
         defer { index += 1 }
         return [calls[index]]
@@ -1043,10 +1109,10 @@ private actor SuspendedModel: CharacterModel {
     func chooseTools(_ turn: ModelTurn) async throws -> [ToolCall] {
         requestCount += 1
         if requestCount > 1 {
-            if case .result(let results) = turn { replies.append(contentsOf: results) }
+            if case .result(let results, _) = turn { replies.append(contentsOf: results) }
             return [batchCall("fallback", #"[{"action":"finish"}]"#)]
         }
-        if case .initial(let observation, _) = turn { initialObservation = observation }
+        if case .initial(let observation, _, _) = turn { initialObservation = observation }
         return await withCheckedContinuation { continuation in
             action = continuation
             requested?.resume()
@@ -1073,6 +1139,13 @@ private struct WirePlayerTurn: Decodable {
     let goal: String
     let observation: WireObservation?
     let instructions: String?
+    let context: WireModelContext?
+}
+
+private struct WireModelContext: Decodable {
+    let worldTick: UInt64
+    let wakeReason: String
+    let planInProgress: Bool
 }
 
 private struct WireObservation: Decodable, Equatable {
@@ -1093,6 +1166,7 @@ private struct WireReceipt: Decodable {
     let results: [ActionOutcome]
     let skipped: Int
     let observation: WireObservation
+    let context: WireModelContext?
     struct Memory: Decodable {
         let entries: [String: String]
         let update: String?
@@ -1278,6 +1352,19 @@ private final class StubChatEndpoint: URLProtocol, @unchecked Sendable {
                         {"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"\#(reasoning)","tool_calls":[\#(String(decoding: encodedCall, as: UTF8.self))]},"finish_reason":"tool_calls"}]}
                         """#.utf8)
                 }
+            } else if url.path.hasPrefix("/plan-test") {
+                status = 200
+                headers = ["Content-Type": "application/json"]
+                let extraField = url.lastPathComponent == "extra-field" ? #", "actions": []"# : ""
+                let proposal = #"{"summary":"Room with an east entrance","placements":[{"x":9,"y":5,"structure":"wall"}]\#(extraField)}"#
+                let content = String(decoding: try! JSONEncoder().encode(proposal), as: UTF8.self)
+                var message = #""content":\#(content)"#
+                if url.lastPathComponent == "act" {
+                    let call = batchCall("unauthorized", #"[{"action":"finish"}]"#)
+                    let encoded = String(decoding: try! JSONEncoder().encode(call), as: UTF8.self)
+                    message += #", "tool_calls":[\#(encoded)]"#
+                }
+                data = Data(#"{"choices":[{"message":{\#(message)},"finish_reason":"stop"}]}"#.utf8)
             } else if url.path.hasPrefix("/stream-test") {
                 status = 200
                 headers = ["Content-Type": "text/event-stream"]

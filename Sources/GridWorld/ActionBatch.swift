@@ -5,6 +5,7 @@ enum CharacterActionName: String, CaseIterable {
     case collectAt = "collect_at", placeAt = "place_at"
     case walkTo = "walk_to", finish
     case acquire, buildBlueprint = "build_blueprint"
+    case applyPlan = "apply_plan", waitForPlan = "wait_for_plan"
 }
 
 enum CharacterAction: Decodable, Sendable {
@@ -14,6 +15,8 @@ enum CharacterAction: Decodable, Sendable {
     case placeAt(Position, Structure, stand: Position? = nil)
     case acquire(Item, count: Int)
     case buildBlueprint([BlueprintPlacement])
+    case applyPlan(UUID)
+    case waitForPlan
     case say(String)
     case invalid
 
@@ -115,6 +118,14 @@ enum CharacterAction: Decodable, Sendable {
                 return
             }
             self = .buildBlueprint(placements)
+        case .applyPlan:
+            guard count == 2, let planID = value(UUID.self, "planID") else {
+                self = .invalid
+                return
+            }
+            self = .applyPlan(planID)
+        case .waitForPlan:
+            self = count == 1 ? .waitForPlan : .invalid
         case .drop:
             guard count == 3, let direction,
                   let item = string("item").flatMap(Item.init(rawValue:)) else {
@@ -203,6 +214,10 @@ struct ToolReceipt: Encodable, Sendable {
     var plans: [Plan]? = nil
     var memory: MemoryReceipt? = nil
     var recentHistory: [[HistoryEvent]]? = nil
+    var requestedPlanID: UUID? = nil
+    var appliedPlan: PlanSummary? = nil
+    var planningSuggested: Bool? = nil
+    var context: ModelContext? = nil
 
     var finished: Bool { results.last == .finished }
 }

@@ -163,12 +163,15 @@ private struct GameView: View {
 
                 if session.isRunning {
                     VStack(alignment: .leading, spacing: 3) {
+                        if session.isPlanning {
+                            Text("Planning in background")
+                        }
                         if session.hasActiveIntent {
                             Text("Executing intent")
                         }
-                        if let status = debugger.exchanges.last?.outcome.liveLabel {
+                        if let status = debugger.exchanges.last(where: { $0.brain == .fast })?.outcome.liveLabel {
                             Text(status)
-                        } else if !session.hasActiveIntent {
+                        } else if !session.hasActiveIntent && !session.isPlanning {
                             Text("Waiting for agent")
                         }
                     }
@@ -176,11 +179,11 @@ private struct GameView: View {
                     .foregroundStyle(.secondary)
                 }
 
-                if session.hasActiveIntent {
+                if session.canInterruptIntent {
                     Button("Interrupt Intent", systemImage: "hand.raised", action: session.interruptIntent)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .help("Keep changes already made and ask the agent to replan")
+                        .help("Cancel the current intent and background planning, then ask the agent to replan")
                 }
 
                 HStack(spacing: 8) {
@@ -298,6 +301,7 @@ private struct ToolActivityRow: View {
         case .act: "figure.walk"
         case .memory: "book.closed"
         case .vision: "eye"
+        case .requestPlan: "map"
         case nil: "wrench"
         }
     }

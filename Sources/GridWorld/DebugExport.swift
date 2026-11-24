@@ -26,6 +26,23 @@ struct APIKeyRedaction {
 final class DebugExport {
     static let logger = Logger(subsystem: "io.gridworld.macos", category: "DebugExport")
 
+    enum PlannerPhase: String {
+        case started = "planner_started"
+        case completed = "planner_completed"
+        case cancelled = "planner_cancelled"
+    }
+
+    private struct PlannerEvent: Encodable {
+        let runID: UUID
+        let planID: UUID
+        let tick: UInt64
+        let toolCallID: String?
+        let sourceExchangeID: UUID?
+        let outcome: String?
+        let reason: String?
+        let placementCount: Int?
+    }
+
     private let automaticRoot: URL?
     private(set) var currentJournal: DebugJournal?
 
@@ -91,6 +108,17 @@ final class DebugExport {
 
     func event(_ kind: String, _ payload: some Encodable) {
         currentJournal?.event(kind, payload)
+    }
+
+    func planner(
+        _ phase: PlannerPhase, runID: UUID, planID: UUID, tick: UInt64,
+        sourceCall: ToolCall? = nil, outcome: String? = nil, reason: String? = nil, placementCount: Int? = nil
+    ) {
+        event(phase.rawValue, PlannerEvent(
+            runID: runID, planID: planID, tick: tick, toolCallID: sourceCall?.id,
+            sourceExchangeID: sourceCall?.debugExchangeID, outcome: outcome, reason: reason,
+            placementCount: placementCount
+        ))
     }
 
     func snapshot(_ state: some Encodable) {

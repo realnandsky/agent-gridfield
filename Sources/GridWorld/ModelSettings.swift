@@ -45,7 +45,8 @@ struct ModelSettings {
         }
     }
 
-    private static let defaultConfiguration = Configuration(address: "https://api.openai.com/v1", model: "gpt-5-mini")
+    private static let defaultConfiguration = Configuration(address: "https://api.openai.com/v1", model: "gpt-5-mini",
+                                                          effort: .low)
     static let presets = [
         defaultConfiguration,
         Configuration(address: "https://open.bigmodel.cn/api/paas/v4", model: "glm-5.3-flash", effort: .low),
@@ -281,7 +282,7 @@ struct ModelSettingsView: View {
                 TextField("API URL", text: $draft.address)
                 TextField("Model", text: $draft.model)
                 SecureField("API Key", text: $newKey, prompt: Text("Leave blank to keep the saved key"))
-                Picker("Reasoning Effort", selection: Binding(
+                Picker("Planning Effort", selection: Binding(
                     get: { !canDisableThinking && draft.effort == .none ? .low : draft.effort },
                     set: { draft.effort = $0 }
                 )) {
