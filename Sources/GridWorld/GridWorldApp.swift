@@ -337,7 +337,7 @@ struct GameActivity: View {
                             }
                         } else {
                             if messages.isEmpty {
-                                Text("No character messages yet.")
+                                Text("No messages yet.")
                                     .foregroundStyle(.secondary)
                             }
                             ForEach(messages) { message in

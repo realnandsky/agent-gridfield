@@ -703,6 +703,7 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
     #expect(firstTurn.goal == goal)
     #expect(firstTurn.context?.wakeReason == "start")
     #expect(firstTurn.context?.planInProgress == false)
+    #expect(firstTurn.context?.recentMessages == [])
     #expect(firstView.ground.count == 12)
     #expect(firstView.above.count == 12)
     #expect((firstView.ground + firstView.above).allSatisfy { expandMapRow($0).count == 17 })
@@ -775,6 +776,11 @@ func chatCompletionsReceivesFeedbackOncePerBatch() async throws {
         #expect(request.messages[2].reasoningContent == "reasoning for \(action.id)")
         let receipt = try decode(WireReceipt.self, request.messages[3].content)
         #expect(receipt.results == results[index])
+        if index == 1 {
+            #expect(receipt.context?.recentMessages == [
+                .init(sender: "Character", text: "I'll cut down a tree first."),
+            ])
+        }
         #expect(receipt.memory?.entries == (index < 2 ? ["idea": "Build a path by the lake"] : ["decision": "Keep the logs for now"]))
         #expect(receipt.memory?.update == updates[index])
         if index < 2 {
@@ -1195,9 +1201,15 @@ private struct WirePlayerTurn: Decodable {
 }
 
 private struct WireModelContext: Decodable {
+    struct Message: Decodable, Equatable {
+        let sender: String
+        let text: String
+    }
+
     let worldTick: UInt64
     let wakeReason: String
     let planInProgress: Bool
+    let recentMessages: [Message]
 }
 
 private struct WireObservation: Decodable, Equatable {

@@ -94,12 +94,24 @@ struct PlanRecord: Identifiable, Equatable, Sendable {
 }
 
 struct ModelContext: Encodable, Sendable {
+    struct ActivePlan: Encodable, Sendable {
+        let planID: UUID
+        let brief: String
+    }
+
+    struct RecentMessage: Encodable, Sendable {
+        let sender: String
+        let text: String
+    }
+
     let worldTick: UInt64
     let wakeReason: GameSession.WakeReason
     let planInProgress: Bool
+    let activePlan: ActivePlan?
     let pendingPlan: PlanSummary?
     let planFailure: String?
     let planningSuggested: Bool?
+    let recentMessages: [RecentMessage]
 }
 
 struct CharacterMessage: Identifiable, Encodable {
@@ -158,7 +170,7 @@ final class GameSession {
     }
 
     private struct PlannerWork {
-        let id: UUID
+        let summary: ModelContext.ActivePlan
         let task: Task<Void, Never>
         let vision: VisionCall?
     }
@@ -391,7 +403,10 @@ final class GameSession {
         steer(reason: .intentInterrupted, eventReason: "player_interrupted")
     }
 
-    func playerInstructionsChanged() {
+    func playerInstructionsChanged(to instructions: String) {
+        if !instructions.isEmpty {
+            messages.append(CharacterMessage(sender: "Player", text: instructions))
+        }
         steer(reason: .playerInput, eventReason: "player_input")
     }
 
@@ -502,8 +517,9 @@ final class GameSession {
                 phase = .awaitingModel
                 let context = ModelContext(
                     worldTick: worldTick, wakeReason: wake, planInProgress: isPlanning,
-                    pendingPlan: pendingPlan?.summary, planFailure: planFailure,
-                    planningSuggested: planningSuggested
+                    activePlan: planner?.summary, pendingPlan: pendingPlan?.summary, planFailure: planFailure,
+                    planningSuggested: planningSuggested,
+                    recentMessages: messages.suffix(3).map { .init(sender: $0.sender, text: $0.text) }
                 )
                 let turn = previousReplies.map { ModelTurn.result($0, context: context) }
                     ?? .initial(world.observation(notebook: notebook), vision: pendingVision.first, context: context)
@@ -742,7 +758,7 @@ final class GameSession {
                 }
             }
         }
-        planner = PlannerWork(id: planID, task: task, vision: vision)
+        planner = PlannerWork(summary: .init(planID: planID, brief: request.brief), task: task, vision: vision)
         isPlanning = true
         planHistory.append(PlanRecord(
             id: planID, brief: request.brief, startedAt: Date(), finishedAt: nil, status: .planning,
@@ -752,7 +768,7 @@ final class GameSession {
     }
 
     private func completePlanner(_ result: Result<PlanProposal, any Error>, planID: UUID, run id: UUID) {
-        guard runID == id, planner?.id == planID else { return }
+        guard runID == id, planner?.summary.planID == planID else { return }
         planner = nil
         isPlanning = false
         let now = Date()
@@ -805,17 +821,18 @@ final class GameSession {
     private func clearPlanning(run id: UUID, reason: String) {
         let now = Date()
         if let planner {
+            let planID = planner.summary.planID
             planner.task.cancel()
             planner.vision?.update(.cancelled)
-            if let index = planHistory.lastIndex(where: { $0.id == planner.id }) {
+            if let index = planHistory.lastIndex(where: { $0.id == planID }) {
                 planHistory[index].status = .cancelled
                 planHistory[index].finishedAt = now
                 planHistory[index].failureReason = reason
             }
             planHandoffs.append(TimelinePlanHandoff(
-                planID: planner.id, at: now, outcome: .cancelled, reason: reason
+                planID: planID, at: now, outcome: .cancelled, reason: reason
             ))
-            debugExport?.planner(.cancelled, runID: id, planID: planner.id, tick: worldTick, reason: reason)
+            debugExport?.planner(.cancelled, runID: id, planID: planID, tick: worldTick, reason: reason)
         } else if let pending = pendingPlan,
                   let index = planHistory.lastIndex(where: { $0.id == pending.summary.planID && $0.status == .ready }) {
             planHistory[index].status = .cancelled

@@ -27,10 +27,14 @@ func fastBrainActsWhilePlanningThenBuildsTheSavedProposal() async throws {
     let beforeProposal = await model.turns
     try #require(beforeProposal.count == 2)
     #expect(beforeProposal[0].context?.wakeReason == .start)
+    #expect(beforeProposal[0].context?.activePlan == nil)
     #expect(beforeProposal[1].context?.wakeReason == .toolResults)
     #expect(beforeProposal[1].context?.planInProgress == true)
     #expect(beforeProposal[1].replies.map(\.results) == [[.planRequested], [.messageSent]])
     let id = try #require(beforeProposal[1].replies.first?.requestedPlanID)
+    #expect(beforeProposal[1].context?.activePlan?.planID == id)
+    #expect(beforeProposal[1].context?.activePlan?.brief == "Two floor tiles")
+    #expect(beforeProposal[1].context?.recentMessages.map(\.text) == ["I'll plan the layout."])
     #expect(await model.requests.first?.id == id)
     #expect(await model.requests.first?.brief == "Two floor tiles")
     await model.deliver("Two floor tiles", proposal: PlanProposal(summary: "Two floors east of spawn", placements: [
@@ -45,6 +49,7 @@ func fastBrainActsWhilePlanningThenBuildsTheSavedProposal() async throws {
     let summary = try #require(ready.pendingPlan)
     #expect(ready.wakeReason == .planReady)
     #expect(!ready.planInProgress)
+    #expect(ready.activePlan == nil)
     #expect(summary.planID == id)
     #expect(summary.summary == "Two floors east of spawn")
     #expect(summary.placementCount == 2)
@@ -52,6 +57,7 @@ func fastBrainActsWhilePlanningThenBuildsTheSavedProposal() async throws {
     #expect(summary.createdTick <= ready.worldTick)
     #expect(summary.createdTick >= (beforeProposal[1].context?.worldTick ?? 0))
     #expect(turns[2].replies.first?.results == [.waitingForPlan])
+    #expect(ready.recentMessages.map(\.text) == ["I'll plan the layout."])
     #expect(turns[3].replies.first?.results == [.built])
     #expect(turns[3].replies.first?.appliedPlan?.planID == id)
     #expect(turns[3].replies.first?.appliedPlan?.summary == summary.summary)
@@ -84,6 +90,7 @@ func unusablePlannerLayoutWakesFastBrainWithFailure() async throws {
     #expect(failed.planFailure?.contains("outside the map") == true)
     #expect(failed.pendingPlan == nil)
     #expect(!failed.planInProgress)
+    #expect(failed.activePlan == nil)
     #expect(game.world == original)
     #expect(game.issue == nil)
 }
@@ -104,13 +111,16 @@ func steeringCancelsTheOldPlannerAndOnlyTheReplacementCanBuild(playerInput: Bool
     game.start(model: model)
 
     try await waitUntilParked(game, model, activities: 2)
-    if playerInput { game.playerInstructionsChanged() } else { game.interruptIntent() }
+    let steering = "Build farther east."
+    if playerInput { game.playerInstructionsChanged(to: steering) } else { game.interruptIntent() }
     try await waitUntilParked(game, model, activities: 4, requests: 2)
     let requests = await model.requests
     let afterSteering = try #require(await model.turns.last?.context)
     #expect(afterSteering.wakeReason == (playerInput ? .playerInput : .intentInterrupted))
     #expect(!afterSteering.planInProgress)
+    #expect(afterSteering.activePlan == nil)
     #expect(afterSteering.pendingPlan == nil)
+    #expect(afterSteering.recentMessages.map(\.text) == (playerInput ? [steering] : []))
     #expect(requests[0].id != requests[1].id)
 
     await model.deliver("Old layout", proposal: floorProposal(x: 9))
@@ -171,10 +181,47 @@ func playerInputWakesFastBrainBeforeTheSupersededRequestReturns() async throws {
     }
     game.start(model: model)
     try await eventually { await model.isSuspended }
-    game.playerInstructionsChanged()
+    game.playerInstructionsChanged(to: "Move the entrance.")
     try await eventually { !game.isRunning }
-    #expect(game.messages.map(\.text) == ["I heard you."])
+    #expect(game.messages.map(\.text) == ["Move the entrance.", "I heard you."])
     await model.release()
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
+func fastBrainSeesTheLastThreeDeliveredMessagesUntilWorldReset() async throws {
+    let model = GatedPlanner { index, _ in
+        if index == 0 {
+            return [act("speak", #"""
+                [{"action":"say","text":"I'll look around."},
+                 {"action":"say","text":"The east side is clear."},
+                 {"action":"finish"},{"action":"say","text":"Skipped."}]
+                """#)]
+        }
+        return [finish]
+    }
+    let game = GameSession(tickInterval: .milliseconds(3))
+    defer { cleanUp(game, model) }
+
+    game.playerInstructionsChanged(to: "Build near the lake.")
+    game.start(model: model)
+    try await eventually { !game.isRunning }
+    game.playerInstructionsChanged(to: "Use an east entrance.")
+    game.playerInstructionsChanged(to: "")
+    game.start(model: model)
+    try await eventually { !game.isRunning }
+    game.reset()
+    game.start(model: model)
+    try await eventually { !game.isRunning }
+
+    let turns = await model.turns
+    try #require(turns.count == 3)
+    #expect(turns[0].context?.recentMessages.map(\.text) == ["Build near the lake."])
+    #expect(turns[1].context?.recentMessages.map(\.sender) == ["Character", "Character", "Player"])
+    #expect(turns[1].context?.recentMessages.map(\.text) == [
+        "I'll look around.", "The east side is clear.", "Use an east entrance.",
+    ])
+    #expect(turns[2].context?.recentMessages.isEmpty == true)
 }
 
 @MainActor

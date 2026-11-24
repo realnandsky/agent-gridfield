@@ -420,7 +420,7 @@ struct APIDebugView: View {
     private func applyPrompt() {
         draft = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         debugger.prompt = draft
-        session.playerInstructionsChanged()
+        session.playerInstructionsChanged(to: draft)
     }
 
     private func openVision(_ id: UUID?) {

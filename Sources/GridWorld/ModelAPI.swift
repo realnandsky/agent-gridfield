@@ -459,6 +459,8 @@ struct ChatCompletionsModel: CharacterModel {
         items[] = [x,y,item,count]; loose and attached items are counted together; omitted = []
         block_state = additional block conditions when present
         Live context is in the opening user message or the last tool receipt. context.worldTick is the current engine tick at 8 Hz and context.wakeReason explains why this decision is requested.
+        context.activePlan gives {planID, brief} while the planner is running.
+        context.recentMessages lists up to three chat messages as {sender, text}, oldest first. Check them before acknowledging the player.
 
         [Memory]
         Each request includes the goal and current world observation. Subsequent requests include the immediately preceding calls, their receipts in call order, and the preceding reasoning when available.
@@ -493,7 +495,7 @@ struct ChatCompletionsModel: CharacterModel {
         Request a plan for complex layouts and multi-room designs. If context.planningSuggested is true after repeated failures, prioritize requesting a plan instead of retrying the same intent.
         When requesting a plan at the start or after player_input, pair request_plan with a short act say in the same response so the player hears from you right away. Save longer notes for later if useful.
         plan_requested means the planner has started in the background. A new request replaces the previous one.
-        The engine automatically gathers and crafts blueprint materials. While context.planInProgress is true, call wait_for_plan immediately unless another short action has a clear benefit for the player’s goal. Skip speculative gathering. Use wait_for_plan as the last action in its batch only while a plan is in progress.
+        The engine automatically gathers and crafts blueprint materials. While context.activePlan covers the goal, call wait_for_plan unless another short action has a clear benefit for the player’s goal. Skip speculative gathering. Use wait_for_plan as the last action in its batch only while a plan is in progress.
         A planner result wakes you if you are waiting. On plan_ready, inspect context.pendingPlan for planID, createdTick, summary, placementCount and bounds. Choose apply_plan if the proposal fits the goal. context.planFailure describes a failed request.
         Use apply_plan with the supplied planID to build the proposal. The engine consumes the proposal when the action starts and validates every saved placement against the current world. plan_unavailable means the ID is unavailable. You can ignore a proposal or replace it with a new request.
         A built receipt with appliedPlan confirms that every placement in the saved design is present. Use appliedPlan.summary and the latest observation to check the player's requirements, then close the run when they are met.
