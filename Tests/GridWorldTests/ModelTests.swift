@@ -17,7 +17,7 @@ private let zhipuTestEndpoint = "https://open.bigmodel.cn/api/paas/v4/chat/compl
     defaults.set(false, forKey: "ModelStreaming")
     let legacy = try #require(ModelSettings.savedConfigurations(in: defaults).first)
     #expect(legacy.model == "local-model")
-    #expect(legacy.effort == .none)
+    #expect(legacy.effort == .low)
     #expect(legacy.streaming == false)
     #expect(!legacy.allowsVision)
 
@@ -966,6 +966,54 @@ func streamedReasoningAndActionsAreAssembledAndIncompleteStreamIsRejected() asyn
 
 @MainActor
 @Test(.timeLimit(.minutes(1)))
+func upgradedDeepSeekProfileSendsFastNoneAndSlowLow() async throws {
+    let suite = "GridWorldTests.\(UUID())"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let savedProfiles = #"""
+        [{"address":"https://api.deepseek.com","model":"deepseek-flash","effort":"none","streaming":true,"visionEnabled":true},
+         {"address":"https://api.openai.com/v1","model":"gpt-5-mini","effort":"high","streaming":false},
+         {"address":"https://api.deepseek.com","model":"deepseek-pro","effort":"automatic","streaming":true}]
+        """#
+    defaults.set(Data(savedProfiles.utf8), forKey: "ModelAPIConfigurations")
+    let upgraded = ModelSettings.savedConfigurations(in: defaults)
+    #expect(upgraded.map(\.effort) == [.low, .high, .automatic])
+    let selected = try #require(upgraded.first)
+    #expect(selected.model == "deepseek-flash")
+    #expect(selected.address == "https://api.deepseek.com")
+    #expect(selected.streaming)
+    #expect(selected.allowsVision)
+
+    let settings = try selected.resolve()
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StubChatEndpoint.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let debugger = APIDebugger()
+    let model = ChatCompletionsModel(endpoint: settings.endpoint, model: settings.model, apiKey: nil,
+                                     taskGoal: "Build a room", reasoningEffort: settings.effort.requestValue,
+                                     streaming: settings.streaming, visionEnabled: settings.configuration.allowsVision,
+                                     session: session, debugger: debugger)
+    let observation = World().observation()
+    _ = try await model.chooseTools(.initial(observation))
+    _ = try await model.plan(brief: "Leave a doorway", observation: observation, vision: nil, planID: UUID())
+
+    #expect(debugger.exchanges.map(\.brain) == [.fast, .slow])
+    let efforts = try debugger.exchanges.map { exchange in
+        let body = try #require(JSONSerialization.jsonObject(with: Data(exchange.requestBody.utf8)) as? [String: Any])
+        return body["reasoning_effort"] as? String
+    }
+    #expect(efforts == ["none", "low"])
+
+    var explicit = selected
+    explicit.effort = .none
+    try explicit.resolve().save(newKey: "", in: defaults)
+    let reopened = try #require(UserDefaults(suiteName: suite))
+    #expect(ModelSettings.savedConfigurations(in: reopened) == [explicit] + Array(upgraded.dropFirst()))
+}
+
+@MainActor
+@Test(.timeLimit(.minutes(1)))
 func plannerUsesSelectedEffortAndAcceptsOnlyStructuredBlueprints() async throws {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [StubChatEndpoint.self]
@@ -1352,7 +1400,14 @@ private final class StubChatEndpoint: URLProtocol, @unchecked Sendable {
                         {"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"\#(reasoning)","tool_calls":[\#(String(decoding: encodedCall, as: UTF8.self))]},"finish_reason":"tool_calls"}]}
                         """#.utf8)
                 }
-            } else if url.path.hasPrefix("/plan-test") {
+            } else if url.absoluteString == "https://api.deepseek.com/chat/completions",
+                      let body = record.body.map({ String(decoding: $0, as: UTF8.self) }), body.contains(#""tools":"#) {
+                status = 200
+                headers = ["Content-Type": "application/json"]
+                let call = batchCall("deepseek-finish", #"[{"action":"finish"}]"#)
+                let encoded = String(decoding: try! JSONEncoder().encode(call), as: UTF8.self)
+                data = Data(#"{"choices":[{"message":{"tool_calls":[\#(encoded)]},"finish_reason":"tool_calls"}]}"#.utf8)
+            } else if url.path.hasPrefix("/plan-test") || url.absoluteString == "https://api.deepseek.com/chat/completions" {
                 status = 200
                 headers = ["Content-Type": "application/json"]
                 let extraField = url.lastPathComponent == "extra-field" ? #", "actions": []"# : ""

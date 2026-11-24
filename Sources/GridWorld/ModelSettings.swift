@@ -52,7 +52,8 @@ struct ModelSettings {
         Configuration(address: "https://open.bigmodel.cn/api/paas/v4", model: "glm-5.3-flash", effort: .low),
         Configuration(address: "https://api.deepseek.com", model: "deepseek-flash", effort: .low),
     ]
-    private static let configurationsPreference = "ModelAPIConfigurations"
+    private static let configurationsPreference = "ModelPlanningConfigurations"
+    private static let legacyConfigurationsPreference = "ModelAPIConfigurations"
     private static let addressPreference = "ModelAPIAddress"
     private static let modelPreference = "ModelAPIModel"
     private static let effortPreference = "ModelThinkingEffort"
@@ -79,15 +80,27 @@ struct ModelSettings {
            let configurations = try? JSONDecoder().decode([Configuration].self, from: data) {
             return configurations
         }
-        guard defaults.object(forKey: addressPreference) != nil || defaults.object(forKey: modelPreference) != nil else {
-            return []
+        let legacyConfigurations: [Configuration]
+        if let data = defaults.data(forKey: legacyConfigurationsPreference),
+           let configurations = try? JSONDecoder().decode([Configuration].self, from: data) {
+            legacyConfigurations = configurations
+        } else if defaults.object(forKey: addressPreference) != nil || defaults.object(forKey: modelPreference) != nil {
+            legacyConfigurations = [Configuration(
+                address: defaults.string(forKey: addressPreference) ?? defaultConfiguration.address,
+                model: defaults.string(forKey: modelPreference) ?? defaultConfiguration.model,
+                effort: defaults.string(forKey: effortPreference).flatMap(ThinkingEffort.init(rawValue:))
+                    ?? defaultConfiguration.effort,
+                streaming: defaults.object(forKey: streamingPreference) as? Bool ?? true
+            )]
+        } else {
+            legacyConfigurations = []
         }
-        return [Configuration(
-            address: defaults.string(forKey: addressPreference) ?? defaultConfiguration.address,
-            model: defaults.string(forKey: modelPreference) ?? defaultConfiguration.model,
-            effort: defaults.string(forKey: effortPreference).flatMap(ThinkingEffort.init(rawValue:)) ?? .automatic,
-            streaming: defaults.object(forKey: streamingPreference) as? Bool ?? true
-        )]
+        // Off in the old settings applied to the main loop. Start planning at Low for those profiles.
+        return legacyConfigurations.map { saved in
+            var configuration = saved
+            if configuration.effort == .none { configuration.effort = .low }
+            return configuration
+        }
     }
 
     init(address: String, model: String, effort: ThinkingEffort = .automatic, streaming: Bool = true,

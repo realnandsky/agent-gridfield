@@ -8,6 +8,8 @@ Open **Settings** with the toolbar gear or ⌘,. Enter the complete Chat Complet
 
 **Planning Effort** sets the Slow Brain's reasoning level and offers Provider Default, Off, Low, High, and Maximum, subject to provider and model support. Both brains share the model and API address. The Fast Brain uses `none` where supported, `minimal` for first-generation GPT-5 models, or `low` on the GLM Flash presets that require thinking. **Stream Responses** is on by default and can be turned off for compatibility. Settings apply on the next run. During a streamed Fast Brain request, the main window shows the request phase. The debugger's **Response** view shows the incoming content. The app executes only complete tool calls.
 
+On upgrade, older configurations with reasoning set to **Off** start with **Low** for planning. To turn off the planner's reasoning on a supported model, choose **Off** in **Planning Effort** and save.
+
 Requests time out after 90 seconds without new data. A single streamed request can run for up to 30 minutes. The total limit for a nonstreamed request is 3 minutes.
 
 **Vision** defaults to on for the GPT-5 mini and GLM-5.3-Flash presets. For a different model, enable it if the model supports image input and function tools. Changes take effect on the next run.
